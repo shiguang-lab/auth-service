@@ -232,7 +232,51 @@ GET  /v1/identity/orgs/{orgId}/members     Authorization: Bearer <IDENTITY_API_T
 - [ ] 无本地用户表、无密码存储、业务表用户引用只存 `sub`
 - [ ] dev 身份开关在生产 fail-fast
 
-## 9. 排错速查
+## 9. 静态资源接入(公共媒体服务)
+
+平台提供统一的公开静态资源服务(图片等"发布型"资源),由 MinIO +
+网关只读入口组成,**没有独立的媒体服务进程**。
+
+```text
+读(公网匿名): https://static.shiguanglab.com/<product>/<path>
+                → Cloudflare CDN → Seoul → 网关(仅 GET/HEAD)→ MinIO public-media
+写(内网凭据): S3 PutObject → http://minio:9000(opc-infra 网络)或
+                http://100.87.115.78:9000(Tailscale)
+```
+
+接入物料(向平台申请):S3 access key 一对 + 产品前缀(如 `opc/`)。
+凭据按前缀限权,写不了别家目录;读是匿名的,不需要凭据。
+
+约定与要求:
+
+- **只放公开资源**。产品内的私有附件(带租户/ACL 语义)留在产品自己的
+  资产系统,不进公共桶;
+- 对象命名推荐内容寻址:`<product>/<sha256>.<ext>`,并在上传时设置
+  `Cache-Control: public, max-age=31536000, immutable`(内容不变才可 immutable)
+  与正确的 `Content-Type`;
+- 浏览器端上传一律经产品后端中转(校验类型/大小后 PutObject),**不发
+  预签名 URL**:S3 写入面只在内网,公网网关只放行 GET/HEAD;
+- 人工上传:MinIO Console(Tailscale `http://100.87.115.78:9001`)或 `mc`。
+
+```ts
+// Node 示例(@aws-sdk/client-s3)
+const s3 = new S3Client({
+  endpoint: "http://minio:9000",
+  region: "us-east-1",
+  credentials: { accessKeyId, secretAccessKey },
+  forcePathStyle: true,
+});
+await s3.send(new PutObjectCommand({
+  Bucket: "public-media",
+  Key: `opc/${sha256hex}.png`,
+  Body: buffer,
+  ContentType: "image/png",
+  CacheControl: "public, max-age=31536000, immutable",
+}));
+// 公网 URL: https://static.shiguanglab.com/opc/<sha256hex>.png
+```
+
+## 10. 排错速查
 
 | 现象 | 常见原因 |
 |---|---|

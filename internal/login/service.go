@@ -60,6 +60,7 @@ type zitadelSessionClient interface {
 	PasswordSession(context.Context, string, string) (zitadel.Session, error)
 	DeleteSession(context.Context, string, string) error
 	CreateHumanUser(context.Context, string, string, string) (zitadel.CreatedUser, error)
+	ListAuthorizations(context.Context, zitadel.AuthorizationFilter) ([]zitadel.Authorization, error)
 }
 
 type identityClaims struct {
@@ -341,6 +342,7 @@ func (s *Service) Password(response http.ResponseWriter, request *http.Request) 
 		AssertionSessionID:    sessionID,
 		Subject:               upstreamSession.Subject,
 		Entitlements:          append([]string(nil), s.cfg.DefaultEntitlements...),
+		PlatformRoles:         s.platformRoles(request.Context(), upstreamSession.Subject),
 		AuthenticationTime:    now,
 		AuthenticationMethods: []string{"pwd"},
 		DisplayName:           firstNonEmpty(upstreamSession.DisplayName, upstreamSession.LoginName),
@@ -423,6 +425,7 @@ func (s *Service) Callback(response http.ResponseWriter, request *http.Request) 
 		AssertionSessionID:    sessionID,
 		Subject:               claims.Subject,
 		Entitlements:          append([]string(nil), s.cfg.DefaultEntitlements...),
+		PlatformRoles:         s.platformRoles(request.Context(), claims.Subject),
 		AuthenticationTime:    authenticationTime,
 		AuthenticationMethods: []string{"federated"},
 		Email:                 claims.Email,
@@ -462,6 +465,7 @@ func (s *Service) Session(response http.ResponseWriter, request *http.Request) {
 		"entitlements":      value.Entitlements,
 		"organization":      organization,
 		"roles":             value.Roles,
+		"platformRoles":     value.PlatformRoles,
 	})
 }
 
@@ -576,6 +580,30 @@ func (s *Service) oidcConfiguration(ctx context.Context) (oauth2.Config, *oidc.I
 	}
 	s.verifier = provider.Verifier(&oidc.Config{ClientID: s.cfg.OIDCClientID})
 	return s.oauth, s.verifier, s.oidcHTTP, nil
+}
+
+// platformRoles resolves context-independent roles granted on the platform
+// project's own organization. Failures degrade to no extra roles: a directory
+// hiccup must never block login, only reduce privileges.
+func (s *Service) platformRoles(ctx context.Context, userID string) []string {
+	if s.cfg.ZitadelProjectID == "" || s.cfg.ZitadelOrganizationID == "" {
+		return nil
+	}
+	authorizations, err := s.zitadel.ListAuthorizations(ctx, zitadel.AuthorizationFilter{
+		UserID:         userID,
+		OrganizationID: s.cfg.ZitadelOrganizationID,
+		ProjectID:      s.cfg.ZitadelProjectID,
+		ActiveOnly:     true,
+	})
+	if err != nil {
+		s.logger.Warn("resolve platform roles", "error", err)
+		return nil
+	}
+	roles := make([]string, 0, 4)
+	for _, authorization := range authorizations {
+		roles = append(roles, authorization.Roles...)
+	}
+	return roles
 }
 
 func (s *Service) serverError(response http.ResponseWriter, err error) {

@@ -346,6 +346,13 @@ type fakeZitadelSessionClient struct {
 	createdPassword string
 }
 
+func (f *fakeZitadelSessionClient) ListAuthorizations(
+	_ context.Context,
+	_ zitadel.AuthorizationFilter,
+) ([]zitadel.Authorization, error) {
+	return nil, nil
+}
+
 func (f *fakeZitadelSessionClient) PasswordSession(_ context.Context, loginName, password string) (zitadel.Session, error) {
 	f.calls++
 	f.loginName = loginName

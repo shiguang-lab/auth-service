@@ -14,7 +14,12 @@ type Session struct {
 	Subject               string    `json:"subject"`
 	OrganizationID        string    `json:"organization_id,omitempty"`
 	OrganizationName      string    `json:"organization_name,omitempty"`
+	// Roles of the active business-organization context (empty when personal).
 	Roles                 []string  `json:"roles,omitempty"`
+	// PlatformRoles are context-independent roles granted on the platform
+	// project itself (for example opc:system-admin). They survive context
+	// switches and are merged into every assertion.
+	PlatformRoles         []string  `json:"platform_roles,omitempty"`
 	Entitlements          []string  `json:"entitlements,omitempty"`
 	AuthenticationTime    time.Time `json:"authentication_time"`
 	AuthenticationMethods []string  `json:"authentication_methods,omitempty"`
@@ -87,6 +92,7 @@ func (s *MemoryStore) Close() error {
 
 func clone(value Session) Session {
 	value.Roles = append([]string(nil), value.Roles...)
+	value.PlatformRoles = append([]string(nil), value.PlatformRoles...)
 	value.Entitlements = append([]string(nil), value.Entitlements...)
 	value.AuthenticationMethods = append([]string(nil), value.AuthenticationMethods...)
 	return value

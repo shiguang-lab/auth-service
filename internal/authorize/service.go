@@ -101,7 +101,7 @@ func (s *Service) Decide(ctx context.Context, request Request) Response {
 		SessionID:             value.AssertionSessionID,
 		DisplayName:           value.DisplayName,
 		OrganizationID:        value.OrganizationID,
-		Roles:                 value.Roles,
+		Roles:                 mergeRoles(value.PlatformRoles, value.Roles),
 		Entitlements:          value.Entitlements,
 		AuthenticationTime:    value.AuthenticationTime,
 		AuthenticationMethods: value.AuthenticationMethods,
@@ -124,6 +124,25 @@ func cookieValue(raw, name string) (string, int) {
 		value = cookieValue
 	}
 	return value, count
+}
+
+// mergeRoles unions platform roles with context roles, preserving order.
+func mergeRoles(platform, contextual []string) []string {
+	if len(platform) == 0 {
+		return contextual
+	}
+	merged := make([]string, 0, len(platform)+len(contextual))
+	seen := make(map[string]struct{}, len(platform)+len(contextual))
+	for _, group := range [][]string{platform, contextual} {
+		for _, role := range group {
+			if _, ok := seen[role]; ok {
+				continue
+			}
+			seen[role] = struct{}{}
+			merged = append(merged, role)
+		}
+	}
+	return merged
 }
 
 func containsAll(actual, required []string) bool {

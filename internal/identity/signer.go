@@ -1,19 +1,20 @@
 package identity
 
 import (
-	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/binary"
-	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"os"
 	"time"
+
+	"github.com/lestrrat-go/jwx/v3/jwa"
+	"github.com/lestrrat-go/jwx/v3/jwk"
+	"github.com/lestrrat-go/jwx/v3/jws"
+	"github.com/lestrrat-go/jwx/v3/jwt"
 )
 
 type Subject struct {
@@ -28,86 +29,100 @@ type Subject struct {
 }
 
 type Signer struct {
-	privateKey *rsa.PrivateKey
+	privateKey jwk.Key
+	publicKeys jwk.Set
 	issuer     string
-	keyID      string
 	ttl        time.Duration
 }
 
 func NewSigner(issuer, keyID, keyFile string, ttl time.Duration) (*Signer, error) {
-	var key *rsa.PrivateKey
+	var raw *rsa.PrivateKey
 	var err error
 	if keyFile == "" {
-		key, err = rsa.GenerateKey(rand.Reader, 2048)
+		raw, err = rsa.GenerateKey(rand.Reader, 2048)
 	} else {
-		key, err = loadPrivateKey(keyFile)
+		raw, err = loadPrivateKey(keyFile)
 	}
 	if err != nil {
 		return nil, err
 	}
-	if err := key.Validate(); err != nil {
+	if err := raw.Validate(); err != nil {
 		return nil, fmt.Errorf("validate signing key: %w", err)
 	}
-	return &Signer{privateKey: key, issuer: issuer, keyID: keyID, ttl: ttl}, nil
+
+	privateKey, err := jwk.Import(raw)
+	if err != nil {
+		return nil, fmt.Errorf("create private JWK: %w", err)
+	}
+	if err := privateKey.Set(jwk.KeyIDKey, keyID); err != nil {
+		return nil, fmt.Errorf("set JWK key ID: %w", err)
+	}
+	if err := privateKey.Set(jwk.AlgorithmKey, jwa.RS256()); err != nil {
+		return nil, fmt.Errorf("set JWK algorithm: %w", err)
+	}
+	if err := privateKey.Set(jwk.KeyUsageKey, "sig"); err != nil {
+		return nil, fmt.Errorf("set JWK usage: %w", err)
+	}
+
+	privateSet := jwk.NewSet()
+	if err := privateSet.AddKey(privateKey); err != nil {
+		return nil, fmt.Errorf("add private JWK: %w", err)
+	}
+	publicKeys, err := jwk.PublicSetOf(privateSet)
+	if err != nil {
+		return nil, fmt.Errorf("derive public JWKS: %w", err)
+	}
+	return &Signer{
+		privateKey: privateKey,
+		publicKeys: publicKeys,
+		issuer:     issuer,
+		ttl:        ttl,
+	}, nil
 }
 
 func (s *Signer) Issue(subject Subject, now time.Time) (string, error) {
-	header := map[string]any{
-		"alg": "RS256",
-		"kid": s.keyID,
-		"typ": "sg-identity+jwt",
-	}
 	jti, err := randomID()
 	if err != nil {
 		return "", err
 	}
+	token := jwt.New()
 	claims := map[string]any{
-		"iss":          s.issuer,
-		"aud":          subject.Audience,
-		"sub":          subject.Subject,
-		"sid":          subject.SessionID,
-		"org_id":       subject.OrganizationID,
-		"roles":        subject.Roles,
-		"entitlements": subject.Entitlements,
-		"auth_time":    subject.AuthenticationTime.Unix(),
-		"amr":          subject.AuthenticationMethods,
-		"jti":          jti,
-		"iat":          now.Unix(),
-		"nbf":          now.Add(-5 * time.Second).Unix(),
-		"exp":          now.Add(s.ttl).Unix(),
+		jwt.IssuerKey:     s.issuer,
+		jwt.AudienceKey:   subject.Audience,
+		jwt.SubjectKey:    subject.Subject,
+		"sid":             subject.SessionID,
+		"org_id":          subject.OrganizationID,
+		"roles":           subject.Roles,
+		"entitlements":    subject.Entitlements,
+		"auth_time":       subject.AuthenticationTime.Unix(),
+		"amr":             subject.AuthenticationMethods,
+		jwt.JwtIDKey:      jti,
+		jwt.IssuedAtKey:   now,
+		jwt.NotBeforeKey:  now.Add(-5 * time.Second),
+		jwt.ExpirationKey: now.Add(s.ttl),
 	}
-	encodedHeader, err := encodeJSON(header)
-	if err != nil {
-		return "", err
+	for name, value := range claims {
+		if err := token.Set(name, value); err != nil {
+			return "", fmt.Errorf("set identity claim %q: %w", name, err)
+		}
 	}
-	encodedClaims, err := encodeJSON(claims)
-	if err != nil {
-		return "", err
+
+	headers := jws.NewHeaders()
+	if err := headers.Set(jws.TypeKey, "sg-identity+jwt"); err != nil {
+		return "", fmt.Errorf("set identity token type: %w", err)
 	}
-	signingInput := encodedHeader + "." + encodedClaims
-	digest := sha256.Sum256([]byte(signingInput))
-	signature, err := rsa.SignPKCS1v15(rand.Reader, s.privateKey, crypto.SHA256, digest[:])
+	signed, err := jwt.Sign(
+		token,
+		jwt.WithKey(jwa.RS256(), s.privateKey, jws.WithProtectedHeaders(headers)),
+	)
 	if err != nil {
 		return "", fmt.Errorf("sign identity token: %w", err)
 	}
-	return signingInput + "." + base64.RawURLEncoding.EncodeToString(signature), nil
+	return string(signed), nil
 }
 
-func (s *Signer) JWKS() map[string]any {
-	public := s.privateKey.PublicKey
-	exponent := make([]byte, 4)
-	binary.BigEndian.PutUint32(exponent, uint32(public.E))
-	exponent = trimLeadingZeros(exponent)
-	return map[string]any{
-		"keys": []map[string]any{{
-			"kty": "RSA",
-			"use": "sig",
-			"alg": "RS256",
-			"kid": s.keyID,
-			"n":   base64.RawURLEncoding.EncodeToString(public.N.Bytes()),
-			"e":   base64.RawURLEncoding.EncodeToString(exponent),
-		}},
-	}
+func (s *Signer) JWKS() jwk.Set {
+	return s.publicKeys
 }
 
 func loadPrivateKey(path string) (*rsa.PrivateKey, error) {
@@ -133,25 +148,10 @@ func loadPrivateKey(path string) (*rsa.PrivateKey, error) {
 	return key, nil
 }
 
-func encodeJSON(value any) (string, error) {
-	body, err := json.Marshal(value)
-	if err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(body), nil
-}
-
 func randomID() (string, error) {
 	var value [16]byte
 	if _, err := rand.Read(value[:]); err != nil {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(value[:]), nil
-}
-
-func trimLeadingZeros(value []byte) []byte {
-	for len(value) > 1 && value[0] == 0 {
-		value = value[1:]
-	}
-	return value
 }

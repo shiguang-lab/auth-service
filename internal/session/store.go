@@ -10,22 +10,29 @@ import (
 var ErrNotFound = errors.New("session not found")
 
 type Session struct {
-	AssertionSessionID    string
-	Subject               string
-	OrganizationID        string
-	Roles                 []string
-	Entitlements          []string
-	AuthenticationTime    time.Time
-	AuthenticationMethods []string
-	CreatedAt             time.Time
-	LastSeenAt            time.Time
-	RevokedAt             time.Time
+	AssertionSessionID    string    `json:"assertion_session_id"`
+	Subject               string    `json:"subject"`
+	OrganizationID        string    `json:"organization_id,omitempty"`
+	Roles                 []string  `json:"roles,omitempty"`
+	Entitlements          []string  `json:"entitlements,omitempty"`
+	AuthenticationTime    time.Time `json:"authentication_time"`
+	AuthenticationMethods []string  `json:"authentication_methods,omitempty"`
+	Email                 string    `json:"email,omitempty"`
+	DisplayName           string    `json:"display_name,omitempty"`
+	PreferredUsername     string    `json:"preferred_username,omitempty"`
+	UpstreamSessionID     string    `json:"upstream_session_id,omitempty"`
+	UpstreamSessionToken  string    `json:"upstream_session_token,omitempty"`
+	CreatedAt             time.Time `json:"created_at"`
+	LastSeenAt            time.Time `json:"last_seen_at"`
+	RevokedAt             time.Time `json:"revoked_at,omitempty"`
 }
 
 type Store interface {
 	Get(context.Context, string) (Session, error)
 	Put(context.Context, string, Session) error
 	Revoke(context.Context, string, time.Time) error
+	Ping(context.Context) error
+	Close() error
 }
 
 type MemoryStore struct {
@@ -66,6 +73,14 @@ func (s *MemoryStore) Revoke(_ context.Context, id string, at time.Time) error {
 	}
 	value.RevokedAt = at
 	s.sessions[id] = value
+	return nil
+}
+
+func (s *MemoryStore) Ping(context.Context) error {
+	return nil
+}
+
+func (s *MemoryStore) Close() error {
 	return nil
 }
 

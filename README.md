@@ -1,41 +1,57 @@
 # Shiguang Auth Service
 
-Central authentication decision service for Shiguang first-party web products.
+Central session and authentication-decision service for Shiguang first-party
+products. It is deliberately separate from the Access Gateway.
 
-The service receives authorization checks only from `access-gateway`, validates
-the opaque parent-domain session, enforces coarse product entitlements, and
-issues a short-lived RS256 identity assertion scoped to one product audience.
+## Technology
 
-## Current scope
+- Go 1.26
+- [Chi v5](https://github.com/go-chi/chi) for the HTTP control plane
+- [go-redis v9](https://github.com/redis/go-redis) for production sessions
+- [jwx v3](https://github.com/lestrrat-go/jwx) for JWT/JWS/JWK handling
+- [go-oidc v3](https://github.com/coreos/go-oidc) and `x/oauth2` for OIDC and PKCE
+- Caddy-compatible forward-auth responses
 
-- Shared-token protected `POST /v1/authorize`
-- Public-route and authenticated-route decisions
-- Duplicate shared-cookie rejection
-- Server-side session store interface
-- In-memory session store for tests and local development only
-- RS256 `sg-identity+jwt` assertions
-- Public JWKS endpoint
-- Liveness and readiness endpoints
+## Responsibilities
 
-OIDC Authorization Code + PKCE, ZITADEL Session API login steps, Redis/Valkey,
-back-channel logout, CSRF, and session lifecycle endpoints are intentionally
-the next implementation milestone. Protected requests fail closed until a
-valid server-side session exists.
+- Validate the opaque parent-domain session cookie.
+- Store server-side sessions in Redis in production.
+- Enforce coarse product entitlements supplied by trusted gateway policy.
+- Issue short-lived RS256 identity assertions scoped to one product audience.
+- Publish public signing keys as JWKS.
+- Own direct Session API login, federated OIDC callback, logout, and session lifecycle.
+
+Product services still enforce resource-level authorization. They never receive
+the shared browser cookie or ZITADEL tokens.
+
+## Implemented
+
+- Gateway-protected `GET /v1/forward-auth`
+- Missing and duplicate shared-cookie rejection
+- Memory session store for tests and development
+- AES-256-GCM encrypted Redis sessions and login transactions
+- RS256 `sg-identity+jwt` assertions through jwx
+- Public JWKS, liveness, and Redis-backed readiness
+- Direct ZITADEL Session API username/password authentication with no browser OIDC round trip
+- Authorization Code + PKCE with `state` and `nonce` for federated identity providers
+- Parent-domain opaque session creation, inspection, and logout
+- Origin validation, CSRF protection, and Redis login rate limiting
+
+Back-channel logout and automated signing-key rotation remain operational
+follow-ups. Explicit logout revokes both platform and ZITADEL sessions.
 
 ## Local development
 
-Go 1.26 is required.
-
 ```bash
-export GATEWAY_SHARED_TOKEN="$(openssl rand -hex 32)"
-go run ./cmd/auth-service
+cp .env.example .env
+set -a && . ./.env && set +a
+make run
 ```
 
-When `IDENTITY_SIGNING_KEY_FILE` is empty in development, the service creates
-an ephemeral RSA key. Production refuses to start without a key file and a
-non-memory session backend. The service does not implicitly load `.env`;
-deployment configuration must be injected by the process supervisor or
-container runtime.
+When `IDENTITY_SIGNING_KEY_FILE` is empty outside production, an ephemeral RSA
+key is generated. Production requires a key file, Redis, and a gateway token of
+at least 32 characters. `ALLOWED_RETURN_ORIGINS` is the comma-separated
+allowlist of first-party origins that may receive the browser after login.
 
 ## Endpoints
 
@@ -44,14 +60,32 @@ container runtime.
 | `GET` | `/health/live` | Public |
 | `GET` | `/health/ready` | Public |
 | `GET` | `/.well-known/jwks.json` | Public |
-| `POST` | `/v1/authorize` | Gateway shared Bearer token |
+| `GET` | `/v1/forward-auth` | `X-SG-Gateway-Token` |
+| `GET` | `/api/auth/federated/start` | Gateway token; federated login only |
+| `POST` | `/api/auth/login/context` | Gateway token + Origin |
+| `POST` | `/api/auth/login/password` | Gateway token + Origin + CSRF |
+| `GET` | `/api/auth/oidc/callback` | Gateway token + OIDC transaction |
+| `GET` | `/api/auth/session` | Gateway token + session cookie |
+| `POST` | `/api/auth/logout` | Gateway token + Origin |
 
-## Commands
+The forward-auth endpoint consumes the standard `X-Forwarded-Method`,
+`X-Forwarded-Uri`, `X-Forwarded-Host`, and `X-Forwarded-Proto` headers plus
+gateway-owned product policy headers. On success it returns `X-SG-Identity`.
 
-```bash
-make test
-make build
-```
+See [docs/architecture.md](docs/architecture.md) for trust boundaries and the
+request flow.
 
-The module path assumes the future GitHub repository will be
-`github.com/shiguanglab/auth-service`.
+## NAS deployment
+
+`deploy/docker-compose.nas.yml` runs Redis and Auth Service on an internal
+backend network and exposes Auth Service only through `shiguang-auth-edge`.
+`deploy/bootstrap-zitadel.sh` creates the confidential OIDC application through
+official ZITADEL APIs and writes its one-time secret only to the NAS private
+`deploy/zitadel-oidc.env` file.
+
+For an application created before the `/api/auth/*` route migration, replace
+the registered redirect URI
+`https://shiguanglab.com/_auth/oidc/callback` with
+`https://shiguanglab.com/api/auth/oidc/callback` before deploying. Existing
+applications are not recreated automatically because doing so would rotate the
+client credentials.

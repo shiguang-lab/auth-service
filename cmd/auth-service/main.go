@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -10,10 +11,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/shiguanglab/auth-service/internal/authorize"
 	"github.com/shiguanglab/auth-service/internal/config"
 	"github.com/shiguanglab/auth-service/internal/httpapi"
 	"github.com/shiguanglab/auth-service/internal/identity"
+	loginservice "github.com/shiguanglab/auth-service/internal/login"
 	"github.com/shiguanglab/auth-service/internal/session"
 )
 
@@ -29,10 +32,42 @@ func main() {
 		logger.Error("initialize identity signer", "error", err)
 		os.Exit(1)
 	}
+	redisOptions, err := redisConfig(cfg)
+	if err != nil {
+		logger.Error("initialize redis configuration", "error", err)
+		os.Exit(1)
+	}
+	store, err := newSessionStore(cfg, redisOptions)
+	if err != nil {
+		logger.Error("initialize session store", "error", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			logger.Error("close session store", "error", err)
+		}
+	}()
+	startupContext, cancelStartup := context.WithTimeout(context.Background(), 20*time.Second)
+	login, err := loginservice.NewService(startupContext, cfg, store, redisOptions, logger)
+	cancelStartup()
+	if err != nil {
+		logger.Error("initialize login service", "error", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if err := login.Close(); err != nil {
+			logger.Error("close login service", "error", err)
+		}
+	}()
 
-	store := session.NewMemoryStore()
 	decision := authorize.NewService(store, signer, cfg.SessionCookieName, cfg.IdleTTL, cfg.AbsoluteTTL)
-	api := httpapi.NewServer(decision, signer, cfg.GatewayToken, logger)
+	readiness := func(ctx context.Context) error {
+		if err := store.Ping(ctx); err != nil {
+			return err
+		}
+		return login.Ping(ctx)
+	}
+	api := httpapi.NewServer(decision, signer, cfg.GatewayToken, readiness, logger, login)
 	server := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           api.Handler(),
@@ -42,7 +77,11 @@ func main() {
 	}
 
 	go func() {
-		logger.Info("auth service listening", "addr", cfg.Addr, "environment", cfg.Environment)
+		logger.Info("auth service listening",
+			"addr", cfg.Addr,
+			"environment", cfg.Environment,
+			"session_backend", cfg.SessionBackend,
+		)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("server stopped unexpectedly", "error", err)
 			os.Exit(1)
@@ -59,4 +98,26 @@ func main() {
 		logger.Error("graceful shutdown failed", "error", err)
 		os.Exit(1)
 	}
+}
+
+func newSessionStore(cfg config.Config, options *redis.Options) (session.Store, error) {
+	switch cfg.SessionBackend {
+	case "memory":
+		return session.NewMemoryStore(), nil
+	case "redis":
+		return session.NewRedisStore(options, cfg.RedisKeyPrefix, cfg.AbsoluteTTL, cfg.SessionEncryptionKey)
+	default:
+		return nil, fmt.Errorf("unsupported session backend %q", cfg.SessionBackend)
+	}
+}
+
+func redisConfig(cfg config.Config) (*redis.Options, error) {
+	if cfg.SessionBackend != "redis" {
+		return nil, nil
+	}
+	options, err := redis.ParseURL(cfg.RedisURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse REDIS_URL: %w", err)
+	}
+	return options, nil
 }

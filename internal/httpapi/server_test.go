@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -20,26 +19,22 @@ import (
 
 const testGatewayToken = "0123456789abcdef0123456789abcdef"
 
-func TestAuthorizeRejectsMissingAndDuplicateSessions(t *testing.T) {
+func TestForwardAuthRejectsMissingAndDuplicateSessions(t *testing.T) {
 	server, _ := newTestServer(t)
 	for name, cookie := range map[string]string{
 		"missing":   "",
 		"duplicate": "__Secure-sg_session=one; __Secure-sg_session=two",
 	} {
 		t.Run(name, func(t *testing.T) {
-			result := authorizeRequest(t, server, authorize.Request{
-				ProductID: "superagents",
-				Audience:  "superagents-bff",
-				Cookie:    cookie,
-			})
-			if result.Allow || result.Status != http.StatusUnauthorized {
-				t.Fatalf("decision = %#v", result)
+			response := forwardAuthRequest(t, server, cookie, testGatewayToken)
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
 			}
 		})
 	}
 }
 
-func TestAuthorizeIssuesAudienceScopedIdentity(t *testing.T) {
+func TestForwardAuthIssuesAudienceScopedIdentity(t *testing.T) {
 	server, store := newTestServer(t)
 	now := time.Now()
 	if err := store.Put(context.Background(), "opaque-session", session.Session{
@@ -56,16 +51,20 @@ func TestAuthorizeIssuesAudienceScopedIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := authorizeRequest(t, server, authorize.Request{
-		ProductID:            "superagents",
-		Audience:             "superagents-bff",
-		Cookie:               "__Secure-sg_session=opaque-session",
-		RequiredEntitlements: []string{"superagents:access"},
-	})
-	if !result.Allow || result.IdentityToken == "" {
-		t.Fatalf("decision = %#v", result)
+	response := forwardAuthRequest(
+		t,
+		server,
+		"__Secure-sg_session=opaque-session",
+		testGatewayToken,
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
 	}
-	parts := strings.Split(result.IdentityToken, ".")
+	token := response.Header().Get(identityHeader)
+	if token == "" {
+		t.Fatal("identity header is empty")
+	}
+	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		t.Fatalf("token parts = %d", len(parts))
 	}
@@ -88,18 +87,17 @@ func TestAuthorizeIssuesAudienceScopedIdentity(t *testing.T) {
 	if err := json.Unmarshal(claimsBody, &claims); err != nil {
 		t.Fatal(err)
 	}
-	if claims["aud"] != "superagents-bff" || claims["sub"] != "zitadel-user-id" {
+	audience, ok := claims["aud"].([]any)
+	if !ok || len(audience) != 1 || audience[0] != "superagents-bff" || claims["sub"] != "zitadel-user-id" {
 		t.Fatalf("claims = %#v", claims)
 	}
 }
 
-func TestAuthorizeRequiresGatewayCredential(t *testing.T) {
+func TestForwardAuthRequiresGatewayCredential(t *testing.T) {
 	server, _ := newTestServer(t)
-	request := httptest.NewRequest(http.MethodPost, "/v1/authorize", bytes.NewReader([]byte(`{"public":true}`)))
-	recorder := httptest.NewRecorder()
-	server.ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d", recorder.Code)
+	response := forwardAuthRequest(t, server, "", "")
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d", response.Code)
 	}
 }
 
@@ -111,27 +109,29 @@ func newTestServer(t *testing.T) (http.Handler, *session.MemoryStore) {
 	}
 	store := session.NewMemoryStore()
 	decision := authorize.NewService(store, signer, "__Secure-sg_session", 12*time.Hour, 7*24*time.Hour)
-	server := NewServer(decision, signer, testGatewayToken, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	server := NewServer(
+		decision,
+		signer,
+		testGatewayToken,
+		store.Ping,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
 	return server.Handler(), store
 }
 
-func authorizeRequest(t *testing.T, server http.Handler, input authorize.Request) authorize.Response {
+func forwardAuthRequest(t *testing.T, server http.Handler, cookie, gatewayToken string) *httptest.ResponseRecorder {
 	t.Helper()
-	body, err := json.Marshal(input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	request := httptest.NewRequest(http.MethodPost, "/v1/authorize", bytes.NewReader(body))
-	request.Header.Set("Authorization", "Bearer "+testGatewayToken)
-	request.Header.Set("Content-Type", "application/json")
-	recorder := httptest.NewRecorder()
-	server.ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("http status = %d body=%s", recorder.Code, recorder.Body.String())
-	}
-	var result authorize.Response
-	if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil {
-		t.Fatal(err)
-	}
-	return result
+	request := httptest.NewRequest(http.MethodGet, "/v1/forward-auth", nil)
+	request.Header.Set(gatewayTokenHeader, gatewayToken)
+	request.Header.Set("X-Forwarded-Method", http.MethodGet)
+	request.Header.Set("X-Forwarded-Proto", "https")
+	request.Header.Set("X-Forwarded-Host", "opc.shiguanglab.com")
+	request.Header.Set("X-Forwarded-Uri", "/workspaces")
+	request.Header.Set("X-SG-Product-ID", "superagents")
+	request.Header.Set("X-SG-Audience", "superagents-bff")
+	request.Header.Set("X-SG-Required-Entitlements", "superagents:access")
+	request.Header.Set("Cookie", cookie)
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	return response
 }

@@ -1,0 +1,57 @@
+name: shiguang-auth
+
+services:
+  redis:
+    image: redis:8.2-alpine
+    restart: unless-stopped
+    env_file:
+      - ./auth.env
+    command:
+      - sh
+      - -ec
+      - exec redis-server --appendonly yes --appendfsync everysec --requirepass "$${REDIS_PASSWORD}"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    volumes:
+      - redis-data:/data
+    networks:
+      - auth-backend
+
+  auth-service:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: shiguang/auth-service:local
+    restart: unless-stopped
+    user: "1000:10"
+    env_file:
+      - ./auth.env
+      - ./zitadel-oidc.env
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./identity-signing.pem:/run/secrets/identity-signing.pem:ro
+      - /volume1/docker/zitadel/data/bootstrap/login-client.pat:/run/secrets/zitadel-login-client.pat:ro
+      - /volume1/docker/zitadel/data/bootstrap/registration-client.pat:/run/secrets/zitadel-registration-client.pat:ro
+    networks:
+      - auth-backend
+      - auth-edge
+      - zitadel
+
+volumes:
+  redis-data:
+    name: shiguang-auth-redis-data
+
+networks:
+  auth-backend:
+    internal: true
+  auth-edge:
+    external: true
+    name: shiguang-auth-edge
+  zitadel:
+    external: true
+    name: zitadel

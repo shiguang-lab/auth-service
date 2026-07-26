@@ -15,6 +15,7 @@ import (
 	"github.com/shiguanglab/auth-service/internal/authorize"
 	"github.com/shiguanglab/auth-service/internal/identity"
 	loginservice "github.com/shiguanglab/auth-service/internal/login"
+	orgservice "github.com/shiguanglab/auth-service/internal/orgs"
 )
 
 const (
@@ -31,6 +32,14 @@ type Server struct {
 	readiness    ReadinessCheck
 	logger       *slog.Logger
 	login        *loginservice.Service
+	orgs         *orgservice.Service
+}
+
+// WithOrganizations attaches the organization domain service. Routes are only
+// mounted when both the login service and this service are configured.
+func (s *Server) WithOrganizations(orgs *orgservice.Service) *Server {
+	s.orgs = orgs
+	return s
 }
 
 func NewServer(
@@ -80,6 +89,22 @@ func (s *Server) Handler() http.Handler {
 			auth.Get("/api/auth/oidc/callback", s.login.Callback)
 			auth.Get("/api/auth/session", s.login.Session)
 			auth.Post("/api/auth/logout", s.login.Logout)
+			if s.orgs != nil {
+				auth.Post("/api/auth/context", s.orgs.SwitchContextHandler)
+				auth.Post("/api/account/orgs", s.orgs.CreateOrganizationHandler)
+				auth.Get("/api/account/orgs", s.orgs.ListMyOrganizationsHandler)
+				auth.Get("/api/account/orgs/{orgID}/members", s.orgs.ListMembersHandler)
+				auth.Post("/api/account/orgs/{orgID}/members", s.orgs.AddMemberHandler)
+				auth.Patch("/api/account/orgs/{orgID}/members/{userID}", s.orgs.UpdateMemberHandler)
+				auth.Delete("/api/account/orgs/{orgID}/members/{userID}", s.orgs.RemoveMemberHandler)
+			}
+		})
+	}
+	if s.orgs != nil {
+		router.Group(func(identityAPI chi.Router) {
+			identityAPI.Use(s.orgs.RequireIdentityAPIToken)
+			identityAPI.Post("/v1/identity/users/batch-get", s.orgs.BatchGetUsersHandler)
+			identityAPI.Get("/v1/identity/orgs/{orgID}/members", s.orgs.ServiceListMembersHandler)
 		})
 	}
 	return router

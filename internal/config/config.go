@@ -26,6 +26,8 @@ type Config struct {
 	ZitadelPATFile             string
 	ZitadelRegistrationPATFile string
 	ZitadelOrganizationID      string
+	ZitadelProjectID           string
+	IdentityAPIToken           string
 	OIDCClientID               string
 	OIDCClientSecret           string
 	OIDCRedirectURL            string
@@ -73,6 +75,8 @@ func Load() (Config, error) {
 		ZitadelPATFile:             strings.TrimSpace(os.Getenv("ZITADEL_PAT_FILE")),
 		ZitadelRegistrationPATFile: strings.TrimSpace(os.Getenv("ZITADEL_REGISTRATION_PAT_FILE")),
 		ZitadelOrganizationID:      strings.TrimSpace(os.Getenv("ZITADEL_ORGANIZATION_ID")),
+		ZitadelProjectID:           strings.TrimSpace(os.Getenv("ZITADEL_PROJECT_ID")),
+		IdentityAPIToken:           strings.TrimSpace(os.Getenv("IDENTITY_API_TOKEN")),
 		OIDCClientID:               strings.TrimSpace(os.Getenv("OIDC_CLIENT_ID")),
 		OIDCClientSecret:           strings.TrimSpace(os.Getenv("OIDC_CLIENT_SECRET")),
 		OIDCRedirectURL:            envOr("OIDC_REDIRECT_URL", "https://shiguanglab.com/api/auth/oidc/callback"),
@@ -129,6 +133,12 @@ func (c Config) Validate() error {
 		if c.ZitadelPATFile == "" || c.ZitadelRegistrationPATFile == "" || c.ZitadelOrganizationID == "" ||
 			c.OIDCClientID == "" || c.OIDCClientSecret == "" || c.OIDCRedirectURL == "" {
 			return errors.New("ZITADEL login, registration and OIDC client configuration are required in production")
+		}
+		if c.ZitadelProjectID == "" {
+			return errors.New("ZITADEL_PROJECT_ID is required in production")
+		}
+		if len(c.IdentityAPIToken) < 32 {
+			return errors.New("IDENTITY_API_TOKEN must contain at least 32 characters in production")
 		}
 	}
 	for _, origin := range c.AllowedReturnOrigins {

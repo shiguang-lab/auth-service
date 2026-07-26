@@ -21,6 +21,7 @@ type Subject struct {
 	Audience              string
 	Subject               string
 	SessionID             string
+	DisplayName           string
 	OrganizationID        string
 	Roles                 []string
 	Entitlements          []string
@@ -91,6 +92,7 @@ func (s *Signer) Issue(subject Subject, now time.Time) (string, error) {
 		jwt.AudienceKey:   subject.Audience,
 		jwt.SubjectKey:    subject.Subject,
 		"sid":             subject.SessionID,
+		"name":            subject.DisplayName,
 		"org_id":          subject.OrganizationID,
 		"roles":           subject.Roles,
 		"entitlements":    subject.Entitlements,

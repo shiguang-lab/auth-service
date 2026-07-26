@@ -37,6 +37,8 @@ func TestProductionAcceptsRedisAndSigningKey(t *testing.T) {
 		ZitadelPATFile:             "/run/secrets/zitadel.pat",
 		ZitadelRegistrationPATFile: "/run/secrets/zitadel-registration.pat",
 		ZitadelOrganizationID:      "organization-id",
+		ZitadelProjectID:           "project-id",
+		IdentityAPIToken:           strings.Repeat("i", 40),
 		OIDCClientID:               "client-id",
 		OIDCClientSecret:           "client-secret",
 		OIDCRedirectURL:            "https://shiguanglab.com/api/auth/oidc/callback",

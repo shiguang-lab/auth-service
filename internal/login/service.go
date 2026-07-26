@@ -67,7 +67,6 @@ type identityClaims struct {
 	Email             string `json:"email"`
 	Name              string `json:"name"`
 	PreferredUsername string `json:"preferred_username"`
-	OrganizationID    string `json:"urn:zitadel:iam:org:id"`
 	Nonce             string `json:"nonce"`
 	AuthTime          int64  `json:"auth_time"`
 }
@@ -418,10 +417,11 @@ func (s *Service) Callback(response http.ResponseWriter, request *http.Request) 
 		s.serverError(response, err)
 		return
 	}
+	// The business context always starts personal: the ZITADEL resident
+	// organization of the account is identity plumbing, not a tenant.
 	value := session.Session{
 		AssertionSessionID:    sessionID,
 		Subject:               claims.Subject,
-		OrganizationID:        claims.OrganizationID,
 		Entitlements:          append([]string(nil), s.cfg.DefaultEntitlements...),
 		AuthenticationTime:    authenticationTime,
 		AuthenticationMethods: []string{"federated"},
@@ -446,6 +446,13 @@ func (s *Service) Session(response http.ResponseWriter, request *http.Request) {
 		writeJSON(response, http.StatusUnauthorized, map[string]any{"authenticated": false})
 		return
 	}
+	var organization any
+	if value.OrganizationID != "" {
+		organization = map[string]string{
+			"id":   value.OrganizationID,
+			"name": value.OrganizationName,
+		}
+	}
 	writeJSON(response, http.StatusOK, map[string]any{
 		"authenticated":     true,
 		"subject":           value.Subject,
@@ -453,7 +460,15 @@ func (s *Service) Session(response http.ResponseWriter, request *http.Request) {
 		"email":             value.Email,
 		"preferredUsername": value.PreferredUsername,
 		"entitlements":      value.Entitlements,
+		"organization":      organization,
+		"roles":             value.Roles,
 	})
+}
+
+// ResolveSession exposes cookie session resolution to sibling services that
+// operate on the authenticated session, such as the organization API.
+func (s *Service) ResolveSession(request *http.Request) (session.Session, string, error) {
+	return s.currentSession(request)
 }
 
 func (s *Service) Logout(response http.ResponseWriter, request *http.Request) {

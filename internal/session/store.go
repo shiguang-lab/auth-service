@@ -13,6 +13,7 @@ type Session struct {
 	AssertionSessionID    string    `json:"assertion_session_id"`
 	Subject               string    `json:"subject"`
 	OrganizationID        string    `json:"organization_id,omitempty"`
+	OrganizationName      string    `json:"organization_name,omitempty"`
 	Roles                 []string  `json:"roles,omitempty"`
 	Entitlements          []string  `json:"entitlements,omitempty"`
 	AuthenticationTime    time.Time `json:"authentication_time"`

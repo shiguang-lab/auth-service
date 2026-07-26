@@ -17,7 +17,9 @@ import (
 	"github.com/shiguanglab/auth-service/internal/httpapi"
 	"github.com/shiguanglab/auth-service/internal/identity"
 	loginservice "github.com/shiguanglab/auth-service/internal/login"
+	orgservice "github.com/shiguanglab/auth-service/internal/orgs"
 	"github.com/shiguanglab/auth-service/internal/session"
+	"github.com/shiguanglab/auth-service/internal/zitadel"
 )
 
 func main() {
@@ -68,6 +70,20 @@ func main() {
 		return login.Ping(ctx)
 	}
 	api := httpapi.NewServer(decision, signer, cfg.GatewayToken, readiness, logger, login)
+	if login != nil && cfg.ZitadelProjectID != "" {
+		directory, err := zitadel.NewClient(
+			cfg.ZitadelInternalURL,
+			cfg.ZitadelIssuer,
+			cfg.ZitadelPATFile,
+			cfg.ZitadelRegistrationPATFile,
+			cfg.ZitadelOrganizationID,
+		)
+		if err != nil {
+			logger.Error("initialize organization directory client", "error", err)
+			os.Exit(1)
+		}
+		api.WithOrganizations(orgservice.NewService(cfg, store, login, directory, logger))
+	}
 	server := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           api.Handler(),

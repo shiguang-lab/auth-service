@@ -99,6 +99,7 @@ func (s *Service) Decide(ctx context.Context, request Request) Response {
 		Audience:              request.Audience,
 		Subject:               value.Subject,
 		SessionID:             value.AssertionSessionID,
+		DisplayName:           value.DisplayName,
 		OrganizationID:        value.OrganizationID,
 		Roles:                 value.Roles,
 		Entitlements:          value.Entitlements,

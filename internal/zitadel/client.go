@@ -52,6 +52,29 @@ type CreatedUser struct {
 	ID string
 }
 
+type Organization struct {
+	ID   string
+	Name string
+}
+
+type Authorization struct {
+	ID             string
+	UserID         string
+	OrganizationID string
+	Roles          []string
+	State          string
+	DisplayName    string
+	LoginName      string
+}
+
+type User struct {
+	ID          string
+	LoginName   string
+	DisplayName string
+	Email       string
+	State       string
+}
+
 type APIError struct {
 	StatusCode int
 }
@@ -147,7 +170,250 @@ func (c *Client) CreateHumanUser(ctx context.Context, username, email, password 
 	return CreatedUser{ID: created.ID}, nil
 }
 
+// CreateOrganization creates a business organization owned by the platform.
+func (c *Client) CreateOrganization(ctx context.Context, name string) (Organization, error) {
+	var created struct {
+		OrganizationID string `json:"organizationId"`
+		ID             string `json:"id"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/v2/organizations", c.pat, map[string]any{"name": name}, &created); err != nil {
+		return Organization{}, err
+	}
+	id := created.OrganizationID
+	if id == "" {
+		id = created.ID
+	}
+	if id == "" {
+		return Organization{}, errors.New("ZITADEL create organization response does not include an id")
+	}
+	return Organization{ID: id, Name: name}, nil
+}
+
+// SearchOrganizationsByIDs resolves organization names for the given ids.
+func (c *Client) SearchOrganizationsByIDs(ctx context.Context, ids []string) ([]Organization, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	organizations := make([]Organization, 0, len(ids))
+	for _, chunk := range chunkStrings(ids, 50) {
+		queries := make([]map[string]any, 0, len(chunk))
+		for _, id := range chunk {
+			queries = append(queries, map[string]any{"idQuery": map[string]string{"id": id}})
+		}
+		var found struct {
+			Result []struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			} `json:"result"`
+		}
+		if err := c.do(ctx, http.MethodPost, "/v2/organizations/_search", c.pat, map[string]any{"queries": queries}, &found); err != nil {
+			return nil, err
+		}
+		for _, item := range found.Result {
+			organizations = append(organizations, Organization{ID: item.ID, Name: item.Name})
+		}
+	}
+	return organizations, nil
+}
+
+// EnsureProjectRole creates a project role, tolerating roles that already exist.
+func (c *Client) EnsureProjectRole(ctx context.Context, projectID, roleKey, displayName string) error {
+	body := map[string]any{"roleKey": roleKey, "displayName": displayName}
+	err := c.doWithOrg(ctx, http.MethodPost, "/management/v1/projects/"+url.PathEscape(projectID)+"/roles", c.pat, c.organizationID, body, nil)
+	var apiError *APIError
+	if errors.As(err, &apiError) && (apiError.StatusCode == http.StatusConflict || apiError.StatusCode == http.StatusBadRequest) {
+		return nil
+	}
+	return err
+}
+
+// EnsureProjectGrant grants the platform project to a business organization so
+// that authorizations can be created on it. Existing grants are tolerated.
+func (c *Client) EnsureProjectGrant(ctx context.Context, projectID, grantedOrgID string, roleKeys []string) error {
+	body := map[string]any{"grantedOrgId": grantedOrgID, "roleKeys": roleKeys}
+	err := c.doWithOrg(ctx, http.MethodPost, "/management/v1/projects/"+url.PathEscape(projectID)+"/grants", c.pat, c.organizationID, body, nil)
+	var apiError *APIError
+	if errors.As(err, &apiError) && apiError.StatusCode == http.StatusConflict {
+		return nil
+	}
+	return err
+}
+
+// CreateAuthorization grants project roles to a user on a business organization.
+func (c *Client) CreateAuthorization(ctx context.Context, userID, projectID, organizationID string, roleKeys []string) (string, error) {
+	body := map[string]any{
+		"userId":         userID,
+		"projectId":      projectID,
+		"organizationId": organizationID,
+		"roleKeys":       roleKeys,
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/v2beta/authorizations", c.pat, body, &created); err != nil {
+		return "", err
+	}
+	return created.ID, nil
+}
+
+// UpdateAuthorization replaces the role keys of an authorization.
+func (c *Client) UpdateAuthorization(ctx context.Context, id string, roleKeys []string) error {
+	return c.do(ctx, http.MethodPatch, "/v2beta/authorizations/"+url.PathEscape(id), c.pat, map[string]any{"roleKeys": roleKeys}, nil)
+}
+
+// DeleteAuthorization removes an authorization.
+func (c *Client) DeleteAuthorization(ctx context.Context, id string) error {
+	return c.do(ctx, http.MethodDelete, "/v2beta/authorizations/"+url.PathEscape(id), c.pat, nil, nil)
+}
+
+type AuthorizationFilter struct {
+	UserID         string
+	OrganizationID string
+	ProjectID      string
+	ActiveOnly     bool
+}
+
+// ListAuthorizations searches authorizations by user and/or organization.
+func (c *Client) ListAuthorizations(ctx context.Context, filter AuthorizationFilter) ([]Authorization, error) {
+	filters := make([]map[string]any, 0, 4)
+	if filter.UserID != "" {
+		filters = append(filters, map[string]any{"userId": map[string]string{"id": filter.UserID}})
+	}
+	if filter.OrganizationID != "" {
+		filters = append(filters, map[string]any{"organizationId": map[string]string{"id": filter.OrganizationID}})
+	}
+	if filter.ProjectID != "" {
+		filters = append(filters, map[string]any{"projectId": map[string]string{"id": filter.ProjectID}})
+	}
+	if filter.ActiveOnly {
+		filters = append(filters, map[string]any{"state": map[string]string{"state": "STATE_ACTIVE"}})
+	}
+	body := map[string]any{
+		"pagination": map[string]any{"limit": 500},
+		"filters":    filters,
+	}
+	var found struct {
+		Authorizations []struct {
+			ID             string   `json:"id"`
+			OrganizationID string   `json:"organizationId"`
+			Roles          []string `json:"roles"`
+			State          string   `json:"state"`
+			User           struct {
+				ID                 string `json:"id"`
+				PreferredLoginName string `json:"preferredLoginName"`
+				DisplayName        string `json:"displayName"`
+			} `json:"user"`
+		} `json:"authorizations"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/v2beta/authorizations/search", c.pat, body, &found); err != nil {
+		return nil, err
+	}
+	authorizations := make([]Authorization, 0, len(found.Authorizations))
+	for _, item := range found.Authorizations {
+		authorizations = append(authorizations, Authorization{
+			ID:             item.ID,
+			UserID:         item.User.ID,
+			OrganizationID: item.OrganizationID,
+			Roles:          append([]string(nil), item.Roles...),
+			State:          item.State,
+			DisplayName:    item.User.DisplayName,
+			LoginName:      item.User.PreferredLoginName,
+		})
+	}
+	return authorizations, nil
+}
+
+// GetUserByLoginName resolves one user by an exact login name.
+func (c *Client) GetUserByLoginName(ctx context.Context, loginName string) (User, error) {
+	body := map[string]any{
+		"queries": []map[string]any{
+			{"loginNameQuery": map[string]any{"loginName": loginName, "method": "TEXT_QUERY_METHOD_EQUALS_IGNORE_CASE"}},
+		},
+	}
+	users, err := c.searchUsers(ctx, body)
+	if err != nil {
+		return User{}, err
+	}
+	if len(users) == 0 {
+		return User{}, &APIError{StatusCode: http.StatusNotFound}
+	}
+	return users[0], nil
+}
+
+// SearchUsersByIDs resolves display information for the given user ids.
+func (c *Client) SearchUsersByIDs(ctx context.Context, ids []string) ([]User, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	users := make([]User, 0, len(ids))
+	for _, chunk := range chunkStrings(ids, 100) {
+		body := map[string]any{
+			"queries": []map[string]any{
+				{"inUserIdsQuery": map[string]any{"userIds": chunk}},
+			},
+		}
+		found, err := c.searchUsers(ctx, body)
+		if err != nil {
+			return nil, err
+		}
+		users = append(users, found...)
+	}
+	return users, nil
+}
+
+func (c *Client) searchUsers(ctx context.Context, body map[string]any) ([]User, error) {
+	var found struct {
+		Result []struct {
+			UserID             string `json:"userId"`
+			PreferredLoginName string `json:"preferredLoginName"`
+			State              string `json:"state"`
+			Human              struct {
+				Profile struct {
+					DisplayName string `json:"displayName"`
+				} `json:"profile"`
+				Email struct {
+					Email string `json:"email"`
+				} `json:"email"`
+			} `json:"human"`
+		} `json:"result"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/v2/users", c.pat, body, &found); err != nil {
+		return nil, err
+	}
+	users := make([]User, 0, len(found.Result))
+	for _, item := range found.Result {
+		users = append(users, User{
+			ID:          item.UserID,
+			LoginName:   item.PreferredLoginName,
+			DisplayName: item.Human.Profile.DisplayName,
+			Email:       item.Human.Email.Email,
+			State:       item.State,
+		})
+	}
+	return users, nil
+}
+
+func (c *Client) doWithOrg(ctx context.Context, method, path, bearer, orgID string, body, result any) error {
+	return c.request(ctx, method, path, bearer, orgID, body, result)
+}
+
 func (c *Client) do(ctx context.Context, method, path, bearer string, body, result any) error {
+	return c.request(ctx, method, path, bearer, "", body, result)
+}
+
+func chunkStrings(values []string, size int) [][]string {
+	var chunks [][]string
+	for start := 0; start < len(values); start += size {
+		end := start + size
+		if end > len(values) {
+			end = len(values)
+		}
+		chunks = append(chunks, values[start:end])
+	}
+	return chunks
+}
+
+func (c *Client) request(ctx context.Context, method, path, bearer, orgID string, body, result any) error {
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
@@ -163,6 +429,9 @@ func (c *Client) do(ctx context.Context, method, path, bearer string, body, resu
 	request.Host = c.host
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("X-Forwarded-Proto", "https")
+	if orgID != "" {
+		request.Header.Set("x-zitadel-orgid", orgID)
+	}
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}

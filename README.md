@@ -73,7 +73,8 @@ The forward-auth endpoint consumes the standard `X-Forwarded-Method`,
 gateway-owned product policy headers. On success it returns `X-SG-Identity`.
 
 See [docs/architecture.md](docs/architecture.md) for trust boundaries and the
-request flow.
+request flow, and [docs/integration.md](docs/integration.md) for the product
+integration guide (assertion contract, shared endpoints, checklists).
 
 ## NAS deployment
 

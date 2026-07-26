@@ -154,10 +154,11 @@ func newTestService(t *testing.T) (*Service, *fakeDirectory, session.Store) {
 	directory := newFakeDirectory()
 	store := session.NewMemoryStore()
 	cfg := config.Config{
-		PublicOrigin:         testOrigin,
-		AllowedReturnOrigins: []string{"https://opc.shiguanglab.com"},
-		ZitadelProjectID:     testProject,
-		IdentityAPIToken:     strings.Repeat("i", 40),
+		PublicOrigin:          testOrigin,
+		AllowedReturnOrigins:  []string{"https://opc.shiguanglab.com"},
+		ZitadelProjectID:      testProject,
+		ZitadelOrganizationID: "platform-org",
+		IdentityAPIToken:      strings.Repeat("i", 40),
 	}
 	service := NewService(cfg, store, staticResolver{store}, directory, nil)
 	return service, directory, store
@@ -327,6 +328,32 @@ func TestMemberManagementLifecycle(t *testing.T) {
 	removedSelf := doJSON(t, handler, http.MethodDelete, base+"/alice", aliceSession, "", nil)
 	if removedSelf.Code != http.StatusNoContent {
 		t.Fatalf("member should be able to leave: %d", removedSelf.Code)
+	}
+}
+
+func TestPlatformOrgNeverSurfacesAsTenant(t *testing.T) {
+	service, directory, store := newTestService(t)
+	sessionID := seedSession(t, store, "alice")
+	handler := routerFor(service)
+
+	// A system-level authorization on the platform organization (for example
+	// opc:system-admin) must not appear in "my organizations"…
+	directory.organizations["platform-org"] = "ZITADEL"
+	directory.nextID++
+	directory.authorizations["authz-platform"] = zitadel.Authorization{
+		ID: "authz-platform", UserID: "alice", OrganizationID: "platform-org",
+		Roles: []string{"opc:system-admin"}, State: "STATE_ACTIVE",
+	}
+
+	listed := doJSON(t, handler, http.MethodGet, "/api/account/orgs", sessionID, "", nil)
+	if listed.Code != http.StatusOK || strings.Contains(listed.Body.String(), "platform-org") {
+		t.Fatalf("platform org must not be listed as a tenant: %d %s", listed.Code, listed.Body.String())
+	}
+
+	// …and must not be a valid switch target.
+	switched := doJSON(t, handler, http.MethodPost, "/api/auth/context", sessionID, `{"organizationId":"platform-org"}`, nil)
+	if switched.Code != http.StatusNotFound {
+		t.Fatalf("switching to the platform org must 404, got %d", switched.Code)
 	}
 }
 

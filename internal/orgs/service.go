@@ -454,15 +454,31 @@ func (s *Service) validOrigin(request *http.Request) bool {
 }
 
 func (s *Service) membershipsOf(ctx context.Context, userID string) ([]zitadel.Authorization, error) {
-	return s.zitadel.ListAuthorizations(ctx, zitadel.AuthorizationFilter{
+	authorizations, err := s.zitadel.ListAuthorizations(ctx, zitadel.AuthorizationFilter{
 		UserID:     userID,
 		ProjectID:  s.cfg.ZitadelProjectID,
 		ActiveOnly: true,
 	})
+	if err != nil {
+		return nil, err
+	}
+	// Authorizations on the platform organization carry system-level roles
+	// (for example opc:system-admin). The platform organization is identity
+	// plumbing, not a business tenant: it must never surface as a switchable
+	// organization.
+	memberships := authorizations[:0]
+	for _, authorization := range authorizations {
+		if authorization.OrganizationID == s.cfg.ZitadelOrganizationID {
+			continue
+		}
+		memberships = append(memberships, authorization)
+	}
+	return memberships, nil
 }
 
 func (s *Service) membershipIn(ctx context.Context, userID, orgID string) (zitadel.Authorization, error) {
-	if strings.TrimSpace(orgID) == "" {
+	// The platform organization is not a business tenant (see membershipsOf).
+	if strings.TrimSpace(orgID) == "" || orgID == s.cfg.ZitadelOrganizationID {
 		return zitadel.Authorization{}, errNotMember
 	}
 	memberships, err := s.zitadel.ListAuthorizations(ctx, zitadel.AuthorizationFilter{

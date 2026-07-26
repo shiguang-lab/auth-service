@@ -82,15 +82,26 @@ jq -n --arg userId "$login_client_user_id" '{userId:$userId,roles:["IAM_OWNER"]}
 status="$(api_call POST /admin/v1/members "$admin_token" "$workdir/iam-member-request.json" "$workdir/iam-member.json")"
 case "$status" in
   2??) echo "Granted IAM_OWNER to login-client ($login_client_user_id)." ;;
-  409) echo "login-client already holds an instance membership." ;;
-  400)
-    if grep -qi "already" "$workdir/iam-member.json"; then
+  *)
+    # An existing membership (for example IAM_LOGIN_CLIENT) makes the add
+    # conflict; merge IAM_OWNER into the current role set instead.
+    printf '{}' > "$workdir/member-search-request.json"
+    search_status="$(api_call POST /admin/v1/members/_search "$admin_token" "$workdir/member-search-request.json" "$workdir/members.json")"
+    require_2xx "$search_status" "search instance members" "$workdir/members.json"
+    merged_roles="$(jq -c --arg userId "$login_client_user_id" \
+      '[.result[]? | select(.userId == $userId) | .roles[]?] + ["IAM_OWNER"] | unique' \
+      "$workdir/members.json")"
+    if jq -e --arg userId "$login_client_user_id" \
+      '.result[]? | select(.userId == $userId) | .roles | index("IAM_OWNER")' \
+      "$workdir/members.json" > /dev/null; then
       echo "login-client already holds IAM_OWNER."
     else
-      require_2xx "$status" "grant IAM_OWNER" "$workdir/iam-member.json"
+      jq -n --argjson roles "$merged_roles" '{roles:$roles}' > "$workdir/member-update-request.json"
+      update_status="$(api_call PUT "/admin/v1/members/$login_client_user_id" "$admin_token" "$workdir/member-update-request.json" "$workdir/member-update.json")"
+      require_2xx "$update_status" "merge IAM_OWNER into login-client roles" "$workdir/member-update.json"
+      echo "Merged IAM_OWNER into login-client roles ($merged_roles)."
     fi
     ;;
-  *) require_2xx "$status" "grant IAM_OWNER" "$workdir/iam-member.json" ;;
 esac
 
 # ── 3. Ensure the platform project roles ─────────────────────────────────────

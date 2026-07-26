@@ -521,7 +521,18 @@ func (s *Service) setSessionCookie(response http.ResponseWriter, value string, m
 }
 
 func (s *Service) validOrigin(request *http.Request) bool {
-	return request.Header.Get("Origin") == s.cfg.PublicOrigin
+	origin := request.Header.Get("Origin")
+	if origin == s.cfg.PublicOrigin {
+		return true
+	}
+	// First-party product origins (for example opc.shiguanglab.com) may call
+	// logout and context endpoints directly; they share the session cookie.
+	for _, allowed := range s.cfg.AllowedReturnOrigins {
+		if origin == strings.TrimRight(allowed, "/") {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) LoginLocation(scheme, host, path string) string {

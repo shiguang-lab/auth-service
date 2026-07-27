@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 )
+
+var providerTokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 type Config struct {
 	Addr                       string
@@ -31,6 +34,7 @@ type Config struct {
 	OIDCClientID               string
 	OIDCClientSecret           string
 	OIDCRedirectURL            string
+	OIDCProviderIDs            map[string]string
 	AllowedReturnOrigins       []string
 	DefaultEntitlements        []string
 	IdentityIssuer             string
@@ -58,6 +62,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	providerIDs, err := parseProviderIDs(os.Getenv("OIDC_PROVIDER_IDS"))
+	if err != nil {
+		return Config{}, err
+	}
 
 	cfg := Config{
 		Addr:                       envOr("AUTH_ADDR", ":8081"),
@@ -80,6 +88,7 @@ func Load() (Config, error) {
 		OIDCClientID:               strings.TrimSpace(os.Getenv("OIDC_CLIENT_ID")),
 		OIDCClientSecret:           strings.TrimSpace(os.Getenv("OIDC_CLIENT_SECRET")),
 		OIDCRedirectURL:            envOr("OIDC_REDIRECT_URL", "https://shiguanglab.com/api/auth/oidc/callback"),
+		OIDCProviderIDs:            providerIDs,
 		AllowedReturnOrigins:       splitCSV(envOr("ALLOWED_RETURN_ORIGINS", "https://shiguanglab.com,https://www.shiguanglab.com,https://opc.shiguanglab.com")),
 		DefaultEntitlements:        splitCSV(envOr("DEFAULT_ENTITLEMENTS", "superagents:access")),
 		IdentityIssuer:             envOr("IDENTITY_ISSUER", "https://auth.shiguanglab.com"),
@@ -175,6 +184,29 @@ func splitCSV(value string) []string {
 		}
 	}
 	return result
+}
+
+func parseProviderIDs(value string) (map[string]string, error) {
+	providerIDs := make(map[string]string)
+	for _, entry := range strings.Split(value, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		parts := strings.SplitN(entry, "=", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("OIDC_PROVIDER_IDS entry %q must use provider=id format", entry)
+		}
+		provider, id := strings.ToLower(strings.TrimSpace(parts[0])), strings.TrimSpace(parts[1])
+		if !providerTokenPattern.MatchString(provider) || !providerTokenPattern.MatchString(id) {
+			return nil, fmt.Errorf("OIDC_PROVIDER_IDS entry %q contains an invalid provider or id", entry)
+		}
+		if _, exists := providerIDs[provider]; exists {
+			return nil, fmt.Errorf("OIDC_PROVIDER_IDS contains duplicate provider %q", provider)
+		}
+		providerIDs[provider] = id
+	}
+	return providerIDs, nil
 }
 
 func envOr(name, fallback string) string {

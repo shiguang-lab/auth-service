@@ -29,6 +29,7 @@ services:
     user: "1000:10"
     env_file:
       - ./auth.env
+      - ./oidc-providers.env
       - ./zitadel-oidc.env
     depends_on:
       redis:

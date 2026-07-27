@@ -52,6 +52,15 @@ When `IDENTITY_SIGNING_KEY_FILE` is empty outside production, an ephemeral RSA
 key is generated. Production requires a key file, Redis, and a gateway token of
 at least 32 characters. `ALLOWED_RETURN_ORIGINS` is the comma-separated
 allowlist of first-party origins that may receive the browser after login.
+`OIDC_PROVIDER_IDS` maps public provider names used by the login UI to ZITADEL
+identity provider IDs, for example `github=383564589272399875,google=383566836731478019`. The mapping is
+required for federated starts and is used to select the provider directly in
+ZITADEL Login V2.
+
+NAS deployments load this non-secret mapping from the versioned
+`deploy/oidc-providers.env` file. Keep OAuth client secrets in the untracked
+`deploy/auth.env`/secret files; when migrating ZITADEL, update only the provider
+IDs in `deploy/oidc-providers.env` and the corresponding provider registrations.
 
 ## Endpoints
 

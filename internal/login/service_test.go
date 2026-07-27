@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/shiguanglab/auth-service/internal/config"
 	"github.com/shiguanglab/auth-service/internal/session"
 	"github.com/shiguanglab/auth-service/internal/zitadel"
+	"golang.org/x/oauth2"
 )
 
 func TestContextCreatesServerSideDirectLoginTransaction(t *testing.T) {
@@ -45,6 +47,40 @@ func TestContextCreatesServerSideDirectLoginTransaction(t *testing.T) {
 	cookies := response.Result().Cookies()
 	if len(cookies) != 1 || cookies[0].Name != csrfCookieName || !cookies[0].HttpOnly || !cookies[0].Secure {
 		t.Fatalf("cookies = %#v", cookies)
+	}
+}
+
+func TestStartRejectsUnsupportedProviderBeforeOIDCDiscovery(t *testing.T) {
+	service, transactions, _, _ := newDirectLoginTestService()
+	request := httptest.NewRequest(http.MethodGet, "/api/auth/federated/start?provider=google&return_to=%2F", nil)
+	response := httptest.NewRecorder()
+
+	service.Start(response, request)
+
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "unsupported_provider") {
+		t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
+	}
+	if len(transactions.transactions) != 0 {
+		t.Fatalf("transactions = %#v", transactions.transactions)
+	}
+}
+
+func TestOAuthConfigForProviderAddsZitadelSelectionScope(t *testing.T) {
+	service, _, _, _ := newDirectLoginTestService()
+	configured := oauth2.Config{Scopes: []string{"openid", "profile"}}
+	selected, err := service.oauthConfigForProvider(configured, "github")
+	if err != nil {
+		t.Fatal(err)
+	}
+	values, err := url.ParseQuery(selected.AuthCodeURL("state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := values.Get("scope"); got != "openid profile "+zitadelSelectIDPScope+"383564589272399875" {
+		t.Fatalf("scope = %q", got)
+	}
+	if len(configured.Scopes) != 2 {
+		t.Fatalf("original scopes mutated: %#v", configured.Scopes)
 	}
 }
 
@@ -264,6 +300,7 @@ func newDirectLoginTestService() (*Service, *fakeTransactionRepository, *fakeZit
 				"https://opc.shiguanglab.com",
 			},
 			DefaultEntitlements: []string{"superagents:access"},
+			OIDCProviderIDs:     map[string]string{"github": "383564589272399875"},
 		},
 		sessions:     sessions,
 		transactions: transactions,

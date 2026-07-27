@@ -53,3 +53,23 @@ func TestProductionAcceptsRedisAndSigningKey(t *testing.T) {
 		t.Fatalf("validate production redis config: %v", err)
 	}
 }
+
+func TestParseProviderIDs(t *testing.T) {
+	got, err := parseProviderIDs("github=383564589272399875, google = 12345")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["github"] != "383564589272399875" || got["google"] != "12345" {
+		t.Fatalf("provider IDs = %#v", got)
+	}
+}
+
+func TestParseProviderIDsRejectsMalformedEntries(t *testing.T) {
+	for _, input := range []string{"github", "github=", "github=id:with-colon", "github=one,github=two"} {
+		t.Run(input, func(t *testing.T) {
+			if _, err := parseProviderIDs(input); err == nil {
+				t.Fatalf("parseProviderIDs(%q) succeeded", input)
+			}
+		})
+	}
+}

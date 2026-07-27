@@ -28,6 +28,8 @@ import (
 
 const csrfCookieName = "__Host-sg_login_csrf"
 
+const zitadelSelectIDPScope = "urn:zitadel:iam:org:idp:id:"
+
 var (
 	usernamePattern = regexp.MustCompile(`^[a-zA-Z0-9_]{3,20}$`)
 	emailPattern    = regexp.MustCompile(`^[^\s@]+@[^\s@]+\.[^\s@]+$`)
@@ -117,6 +119,11 @@ func (s *Service) Ping(ctx context.Context) error {
 }
 
 func (s *Service) Start(response http.ResponseWriter, request *http.Request) {
+	provider := strings.TrimSpace(strings.ToLower(request.URL.Query().Get("provider")))
+	if _, ok := s.cfg.OIDCProviderIDs[provider]; !ok {
+		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "unsupported_provider"})
+		return
+	}
 	oauthConfig, _, _, err := s.oidcConfiguration(request.Context())
 	if err != nil {
 		s.serverError(response, err)
@@ -144,6 +151,11 @@ func (s *Service) Start(response http.ResponseWriter, request *http.Request) {
 		s.serverError(response, err)
 		return
 	}
+	oauthConfig, err = s.oauthConfigForProvider(oauthConfig, provider)
+	if err != nil {
+		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "unsupported_provider"})
+		return
+	}
 	location := oauthConfig.AuthCodeURL(
 		state,
 		oauth2.AccessTypeOffline,
@@ -151,6 +163,15 @@ func (s *Service) Start(response http.ResponseWriter, request *http.Request) {
 		oauth2.SetAuthURLParam("nonce", nonce),
 	)
 	http.Redirect(response, request, location, http.StatusFound)
+}
+
+func (s *Service) oauthConfigForProvider(oauthConfig oauth2.Config, provider string) (oauth2.Config, error) {
+	providerID, ok := s.cfg.OIDCProviderIDs[provider]
+	if !ok {
+		return oauth2.Config{}, fmt.Errorf("unsupported federated provider %q", provider)
+	}
+	oauthConfig.Scopes = append(append([]string(nil), oauthConfig.Scopes...), zitadelSelectIDPScope+providerID)
+	return oauthConfig, nil
 }
 
 func (s *Service) Context(response http.ResponseWriter, request *http.Request) {

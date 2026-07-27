@@ -33,7 +33,7 @@ the shared browser cookie or ZITADEL tokens.
 - RS256 `sg-identity+jwt` assertions through jwx
 - Public JWKS, liveness, and Redis-backed readiness
 - Direct ZITADEL Session API username/password authentication with no browser OIDC round trip
-- Authorization Code + PKCE with `state` and `nonce` for federated identity providers
+- ZITADEL IDP Intent callbacks for GitHub/Google; existing links sign in directly and new identities continue in Website's custom registration page
 - Parent-domain opaque session creation, inspection, and logout
 - Origin validation, CSRF protection, and Redis login rate limiting
 
@@ -71,9 +71,12 @@ IDs in `deploy/oidc-providers.env` and the corresponding provider registrations.
 | `GET` | `/.well-known/jwks.json` | Public |
 | `GET` | `/v1/forward-auth` | `X-SG-Gateway-Token` |
 | `GET` | `/api/auth/federated/start` | Gateway token; federated login only |
+| `GET` | `/api/auth/register/provider` | Gateway token; starts Website-owned federated registration |
 | `POST` | `/api/auth/login/context` | Gateway token + Origin |
 | `POST` | `/api/auth/login/password` | Gateway token + Origin + CSRF |
 | `GET` | `/api/auth/oidc/callback` | Gateway token + OIDC transaction |
+| `POST` | `/api/auth/register/federated/context` | Gateway token + Origin + pending federated transaction |
+| `POST` | `/api/auth/register/federated` | Gateway token + Origin + CSRF |
 | `GET` | `/api/auth/session` | Gateway token + session cookie |
 | `POST` | `/api/auth/logout` | Gateway token + Origin |
 

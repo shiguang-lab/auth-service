@@ -86,6 +86,8 @@ func (s *Server) Handler() http.Handler {
 			auth.Post("/api/auth/register/context", s.login.RegistrationContext)
 			auth.Post("/api/auth/register", s.login.Register)
 			auth.Get("/api/auth/register/provider", s.login.Start)
+			auth.Post("/api/auth/register/federated/context", s.login.FederatedRegistrationContext)
+			auth.Post("/api/auth/register/federated", s.login.RegisterFederated)
 			auth.Get("/api/auth/oidc/callback", s.login.Callback)
 			auth.Get("/api/auth/idp-links/start", s.login.StartIDPLink)
 			auth.Get("/api/auth/idp-links/callback", s.login.IDPLinkCallback)

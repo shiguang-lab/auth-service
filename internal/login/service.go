@@ -56,6 +56,9 @@ type transactionRepository interface {
 	deleteLinkTransaction(context.Context, string) error
 	putAttempt(context.Context, string, loginAttempt) error
 	takeAttempt(context.Context, string) (loginAttempt, error)
+	putFederatedRegistration(context.Context, federatedRegistration) error
+	getFederatedRegistration(context.Context, string) (federatedRegistration, error)
+	takeFederatedRegistration(context.Context, string) (federatedRegistration, error)
 	allowAttempt(context.Context, string) (bool, error)
 	ping(context.Context) error
 	close() error
@@ -65,6 +68,7 @@ type zitadelSessionClient interface {
 	PasswordSession(context.Context, string, string) (zitadel.Session, error)
 	DeleteSession(context.Context, string, string) error
 	CreateHumanUser(context.Context, string, string, string) (zitadel.CreatedUser, error)
+	CreateHumanUserWithIDPLink(context.Context, string, string, string, zitadel.IDPLink) (zitadel.CreatedUser, error)
 	ListAuthorizations(context.Context, zitadel.AuthorizationFilter) ([]zitadel.Authorization, error)
 	StartIdentityProviderIntent(context.Context, string, string, string) (string, error)
 	RetrieveIdentityProviderIntent(context.Context, string, string) (zitadel.IDPInformation, error)
@@ -127,13 +131,9 @@ func (s *Service) Ping(ctx context.Context) error {
 
 func (s *Service) Start(response http.ResponseWriter, request *http.Request) {
 	provider := strings.TrimSpace(strings.ToLower(request.URL.Query().Get("provider")))
-	if _, ok := s.cfg.OIDCProviderIDs[provider]; !ok {
+	providerID, ok := s.cfg.OIDCProviderIDs[provider]
+	if !ok {
 		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "unsupported_provider"})
-		return
-	}
-	oauthConfig, _, _, err := s.oidcConfiguration(request.Context())
-	if err != nil {
-		s.serverError(response, err)
 		return
 	}
 	state, err := randomValue(32)
@@ -141,35 +141,25 @@ func (s *Service) Start(response http.ResponseWriter, request *http.Request) {
 		s.serverError(response, err)
 		return
 	}
-	nonce, err := randomValue(32)
-	if err != nil {
-		s.serverError(response, err)
-		return
-	}
-	verifier := oauth2.GenerateVerifier()
 	value := transaction{
-		State:        state,
-		Nonce:        nonce,
-		PKCEVerifier: verifier,
-		ReturnTo:     s.safeReturnTo(request.URL.Query().Get("return_to")),
-		CreatedAt:    time.Now().UTC(),
+		State:     state,
+		Provider:  provider,
+		Federated: true,
+		ReturnTo:  s.safeReturnTo(request.URL.Query().Get("return_to")),
+		CreatedAt: time.Now().UTC(),
 	}
 	if err := s.transactions.putTransaction(request.Context(), value); err != nil {
 		s.serverError(response, err)
 		return
 	}
-	oauthConfig, err = s.oauthConfigForProvider(oauthConfig, provider)
+	callback := strings.TrimRight(s.cfg.PublicOrigin, "/") + "/api/auth/oidc/callback?state=" + url.QueryEscape(state)
+	authURL, err := s.zitadel.StartIdentityProviderIntent(request.Context(), providerID, callback, callback)
 	if err != nil {
-		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "unsupported_provider"})
+		_ = s.transactions.deleteTransaction(request.Context(), state)
+		s.serverError(response, err)
 		return
 	}
-	location := oauthConfig.AuthCodeURL(
-		state,
-		oauth2.AccessTypeOffline,
-		oauth2.S256ChallengeOption(verifier),
-		oauth2.SetAuthURLParam("nonce", nonce),
-	)
-	http.Redirect(response, request, location, http.StatusFound)
+	http.Redirect(response, request, authURL, http.StatusFound)
 }
 
 func (s *Service) oauthConfigForProvider(oauthConfig oauth2.Config, provider string) (oauth2.Config, error) {
@@ -309,6 +299,136 @@ func (s *Service) Register(response http.ResponseWriter, request *http.Request) 
 	writeJSON(response, http.StatusCreated, map[string]string{"status": "verification_pending"})
 }
 
+func (s *Service) FederatedRegistrationContext(response http.ResponseWriter, request *http.Request) {
+	if !s.validOrigin(request) {
+		writeJSON(response, http.StatusForbidden, map[string]string{"error": "invalid_origin"})
+		return
+	}
+	var input struct {
+		TransactionID string `json:"transactionId"`
+	}
+	if err := decodeJSON(request, &input); err != nil || input.TransactionID == "" || len(input.TransactionID) > 128 {
+		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	pending, err := s.transactions.getFederatedRegistration(request.Context(), input.TransactionID)
+	if err != nil || pending.CSRFToken == "" {
+		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "expired_registration"})
+		return
+	}
+	http.SetCookie(response, &http.Cookie{
+		Name:     csrfCookieName,
+		Value:    pending.CSRFToken,
+		Path:     "/",
+		MaxAge:   600,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	writeJSON(response, http.StatusOK, map[string]string{
+		"transactionId": pending.TransactionID,
+		"csrfToken":     pending.CSRFToken,
+		"provider":      pending.Provider,
+		"email":         pending.SuggestedEmail,
+		"username":      pending.ExternalUserName,
+		"displayName":   pending.SuggestedName,
+	})
+}
+
+func (s *Service) RegisterFederated(response http.ResponseWriter, request *http.Request) {
+	if !s.validOrigin(request) {
+		writeJSON(response, http.StatusForbidden, map[string]string{"error": "invalid_origin"})
+		return
+	}
+	var input struct {
+		TransactionID string `json:"transactionId"`
+		CSRFToken     string `json:"csrfToken"`
+		Username      string `json:"username"`
+		Email         string `json:"email"`
+		Password      string `json:"password"`
+	}
+	if err := decodeJSON(request, &input); err != nil {
+		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	csrfCookie, err := request.Cookie(csrfCookieName)
+	if err != nil || input.CSRFToken == "" || !constantEqual(csrfCookie.Value, input.CSRFToken) {
+		writeJSON(response, http.StatusForbidden, map[string]string{"error": "invalid_csrf"})
+		return
+	}
+	input.Username = strings.TrimSpace(input.Username)
+	input.Email = strings.ToLower(strings.TrimSpace(input.Email))
+	if input.TransactionID == "" || !usernamePattern.MatchString(input.Username) ||
+		!emailPattern.MatchString(input.Email) || len(input.Email) > 200 ||
+		len(input.Password) < 8 || len(input.Password) > 200 ||
+		!containsLetter(input.Password) || !containsDigit(input.Password) {
+		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid_registration"})
+		return
+	}
+	allowed, err := s.transactions.allowAttempt(
+		request.Context(),
+		"federated-register|"+clientIdentity(request)+"|"+input.Email,
+	)
+	if err != nil {
+		s.serverError(response, err)
+		return
+	}
+	if !allowed {
+		writeJSON(response, http.StatusTooManyRequests, map[string]string{"error": "try_again_later"})
+		return
+	}
+	pending, err := s.transactions.takeFederatedRegistration(request.Context(), input.TransactionID)
+	if err != nil {
+		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "expired_registration"})
+		return
+	}
+	if !constantEqual(pending.CSRFToken, input.CSRFToken) ||
+		pending.IDPID != s.cfg.OIDCProviderIDs[pending.Provider] || pending.ExternalUserID == "" {
+		writeJSON(response, http.StatusForbidden, map[string]string{"error": "invalid_registration"})
+		return
+	}
+	restorePending := func() {
+		if err := s.transactions.putFederatedRegistration(request.Context(), pending); err != nil {
+			s.logger.Error("restore federated registration", "error", err)
+		}
+	}
+	created, err := s.zitadel.CreateHumanUserWithIDPLink(
+		request.Context(),
+		input.Username,
+		input.Email,
+		input.Password,
+		zitadel.IDPLink{IDPID: pending.IDPID, UserID: pending.ExternalUserID, UserName: pending.ExternalUserName},
+	)
+	if err != nil {
+		restorePending()
+		var apiError *zitadel.APIError
+		if errors.As(err, &apiError) {
+			switch apiError.StatusCode {
+			case http.StatusConflict:
+				writeJSON(response, http.StatusConflict, map[string]string{"error": "account_exists"})
+			case http.StatusBadRequest:
+				writeJSON(response, http.StatusBadRequest, map[string]string{"error": "registration_rejected"})
+			default:
+				s.serverError(response, err)
+			}
+			return
+		}
+		s.serverError(response, err)
+		return
+	}
+	info := zitadel.IDPInformation{
+		UserName:    pending.ExternalUserName,
+		Email:       input.Email,
+		DisplayName: firstNonEmpty(pending.SuggestedName, input.Username),
+	}
+	if err := s.createFederatedSession(request.Context(), response, created.ID, info); err != nil {
+		s.serverError(response, err)
+		return
+	}
+	clearCSRFCookie(response)
+	writeJSON(response, http.StatusCreated, map[string]string{"redirect": pending.ReturnTo})
+}
+
 func (s *Service) Password(response http.ResponseWriter, request *http.Request) {
 	if !s.validOrigin(request) {
 		writeJSON(response, http.StatusForbidden, map[string]string{"error": "invalid_origin"})
@@ -403,6 +523,10 @@ func (s *Service) Callback(response http.ResponseWriter, request *http.Request) 
 		return
 	}
 	_ = s.transactions.deleteTransaction(request.Context(), state)
+	if tx.Federated {
+		s.federatedCallback(response, request, tx)
+		return
+	}
 	if oidcError := request.URL.Query().Get("error"); oidcError != "" {
 		s.redirectOIDCResult(response, request, tx.ReturnTo, "error")
 		return
@@ -476,6 +600,100 @@ func (s *Service) Callback(response http.ResponseWriter, request *http.Request) 
 	}
 	s.setSessionCookie(response, sessionID, int(s.cfg.AbsoluteTTL.Seconds()))
 	s.redirectOIDCResult(response, request, tx.ReturnTo, "success")
+}
+
+func (s *Service) federatedCallback(response http.ResponseWriter, request *http.Request, tx transaction) {
+	if request.URL.Query().Get("error") != "" {
+		s.redirectOIDCResult(response, request, tx.ReturnTo, "error")
+		return
+	}
+	intentID := firstNonEmpty(request.URL.Query().Get("idp_intent_id"), request.URL.Query().Get("idpIntentId"))
+	intentToken := firstNonEmpty(request.URL.Query().Get("idp_intent_token"), request.URL.Query().Get("idpIntentToken"))
+	if intentID == "" || intentToken == "" {
+		s.redirectOIDCResult(response, request, tx.ReturnTo, "error")
+		return
+	}
+	info, err := s.zitadel.RetrieveIdentityProviderIntent(request.Context(), intentID, intentToken)
+	if err != nil || info.IDPID != s.cfg.OIDCProviderIDs[tx.Provider] || info.UserID == "" {
+		s.redirectOIDCResult(response, request, tx.ReturnTo, "error")
+		return
+	}
+	if info.LinkedUserID != "" {
+		if err := s.createFederatedSession(request.Context(), response, info.LinkedUserID, info); err != nil {
+			s.logger.Error("create federated session", "error", err)
+			s.redirectOIDCResult(response, request, tx.ReturnTo, "error")
+			return
+		}
+		s.redirectOIDCResult(response, request, tx.ReturnTo, "success")
+		return
+	}
+	registrationID, err := randomValue(32)
+	if err != nil {
+		s.redirectOIDCResult(response, request, tx.ReturnTo, "error")
+		return
+	}
+	csrf, err := randomValue(32)
+	if err != nil {
+		s.redirectOIDCResult(response, request, tx.ReturnTo, "error")
+		return
+	}
+	pending := federatedRegistration{
+		TransactionID:    registrationID,
+		CSRFToken:        csrf,
+		Provider:         tx.Provider,
+		IDPID:            info.IDPID,
+		ExternalUserID:   info.UserID,
+		ExternalUserName: info.UserName,
+		SuggestedEmail:   info.Email,
+		SuggestedName:    info.DisplayName,
+		ReturnTo:         tx.ReturnTo,
+		CreatedAt:        time.Now().UTC(),
+	}
+	if err := s.transactions.putFederatedRegistration(request.Context(), pending); err != nil {
+		s.logger.Error("store federated registration", "error", err)
+		s.redirectOIDCResult(response, request, tx.ReturnTo, "error")
+		return
+	}
+	location := "/register?" + url.Values{
+		"mode":           {"federated"},
+		"transaction_id": {registrationID},
+		"return_to":      {tx.ReturnTo},
+	}.Encode()
+	http.Redirect(response, request, location, http.StatusFound)
+}
+
+func (s *Service) createFederatedSession(
+	ctx context.Context,
+	response http.ResponseWriter,
+	subject string,
+	info zitadel.IDPInformation,
+) error {
+	if subject == "" {
+		return errors.New("federated identity does not include a user subject")
+	}
+	now := time.Now().UTC()
+	sessionID, err := randomValue(32)
+	if err != nil {
+		return err
+	}
+	value := session.Session{
+		AssertionSessionID:    sessionID,
+		Subject:               subject,
+		Entitlements:          append([]string(nil), s.cfg.DefaultEntitlements...),
+		PlatformRoles:         s.platformRoles(ctx, subject),
+		AuthenticationTime:    now,
+		AuthenticationMethods: []string{"federated"},
+		Email:                 info.Email,
+		DisplayName:           firstNonEmpty(info.DisplayName, info.UserName),
+		PreferredUsername:     info.UserName,
+		CreatedAt:             now,
+		LastSeenAt:            now,
+	}
+	if err := s.sessions.Put(ctx, sessionID, value); err != nil {
+		return err
+	}
+	s.setSessionCookie(response, sessionID, int(s.cfg.AbsoluteTTL.Seconds()))
+	return nil
 }
 
 // StartIDPLink begins a server-bound account linking transaction. The current

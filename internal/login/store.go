@@ -19,6 +19,8 @@ type transaction struct {
 	State        string    `json:"state"`
 	Nonce        string    `json:"nonce"`
 	PKCEVerifier string    `json:"pkce_verifier"`
+	Provider     string    `json:"provider,omitempty"`
+	Federated    bool      `json:"federated,omitempty"`
 	ReturnTo     string    `json:"return_to"`
 	CreatedAt    time.Time `json:"created_at"`
 }
@@ -35,6 +37,19 @@ type loginAttempt struct {
 	CSRFToken string    `json:"csrf_token"`
 	ReturnTo  string    `json:"return_to"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+type federatedRegistration struct {
+	TransactionID    string    `json:"transaction_id"`
+	CSRFToken        string    `json:"csrf_token"`
+	Provider         string    `json:"provider"`
+	IDPID            string    `json:"idp_id"`
+	ExternalUserID   string    `json:"external_user_id"`
+	ExternalUserName string    `json:"external_user_name"`
+	SuggestedEmail   string    `json:"suggested_email"`
+	SuggestedName    string    `json:"suggested_name"`
+	ReturnTo         string    `json:"return_to"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 type transactionStore struct {
@@ -94,21 +109,29 @@ func (s *transactionStore) putAttempt(ctx context.Context, transactionID string,
 }
 
 func (s *transactionStore) takeAttempt(ctx context.Context, transactionID string) (loginAttempt, error) {
-	key := s.key("attempt:", transactionID)
-	body, err := s.client.GetDel(ctx, key).Bytes()
-	if errors.Is(err, redis.Nil) {
-		return loginAttempt{}, errTransactionNotFound
-	}
-	if err != nil {
-		return loginAttempt{}, err
-	}
-	plaintext, err := s.codec.Open(body, key)
-	if err != nil {
-		return loginAttempt{}, err
-	}
 	var value loginAttempt
-	if err := json.Unmarshal(plaintext, &value); err != nil {
+	if err := s.take(ctx, "attempt:", transactionID, &value); err != nil {
 		return loginAttempt{}, err
+	}
+	return value, nil
+}
+
+func (s *transactionStore) putFederatedRegistration(ctx context.Context, value federatedRegistration) error {
+	return s.put(ctx, "federated-registration:", value.TransactionID, value, s.ttl)
+}
+
+func (s *transactionStore) getFederatedRegistration(ctx context.Context, transactionID string) (federatedRegistration, error) {
+	var value federatedRegistration
+	if err := s.get(ctx, "federated-registration:", transactionID, &value); err != nil {
+		return federatedRegistration{}, err
+	}
+	return value, nil
+}
+
+func (s *transactionStore) takeFederatedRegistration(ctx context.Context, transactionID string) (federatedRegistration, error) {
+	var value federatedRegistration
+	if err := s.take(ctx, "federated-registration:", transactionID, &value); err != nil {
+		return federatedRegistration{}, err
 	}
 	return value, nil
 }
@@ -151,6 +174,25 @@ func (s *transactionStore) put(ctx context.Context, kind, id string, value any, 
 func (s *transactionStore) get(ctx context.Context, kind, id string, value any) error {
 	key := s.key(kind, id)
 	body, err := s.client.Get(ctx, key).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return errTransactionNotFound
+	}
+	if err != nil {
+		return err
+	}
+	plaintext, err := s.codec.Open(body, key)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(plaintext, value); err != nil {
+		return fmt.Errorf("decode login transaction: %w", err)
+	}
+	return nil
+}
+
+func (s *transactionStore) take(ctx context.Context, kind, id string, value any) error {
+	key := s.key(kind, id)
+	body, err := s.client.GetDel(ctx, key).Bytes()
 	if errors.Is(err, redis.Nil) {
 		return errTransactionNotFound
 	}

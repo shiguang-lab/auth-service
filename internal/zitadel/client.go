@@ -82,9 +82,12 @@ type IDPLink struct {
 }
 
 type IDPInformation struct {
-	IDPID    string
-	UserID   string
-	UserName string
+	IDPID        string
+	UserID       string
+	UserName     string
+	LinkedUserID string
+	Email        string
+	DisplayName  string
 }
 
 type APIError struct {
@@ -183,18 +186,54 @@ func (c *Client) RetrieveIdentityProviderIntent(ctx context.Context, intentID, i
 			UserID   string `json:"userId"`
 			UserName string `json:"userName"`
 		} `json:"idpInformation"`
-		UserID string `json:"userId"`
+		UserID       string `json:"userId"`
+		AddHumanUser struct {
+			Username string `json:"username"`
+			Profile  struct {
+				GivenName   string `json:"givenName"`
+				FamilyName  string `json:"familyName"`
+				DisplayName string `json:"displayName"`
+			} `json:"profile"`
+			Email struct {
+				Email string `json:"email"`
+			} `json:"email"`
+		} `json:"addHumanUser"`
+		CreateUser struct {
+			Username string `json:"username"`
+			Human    struct {
+				Profile struct {
+					GivenName   string `json:"givenName"`
+					FamilyName  string `json:"familyName"`
+					DisplayName string `json:"displayName"`
+				} `json:"profile"`
+				Email struct {
+					Email string `json:"email"`
+				} `json:"email"`
+			} `json:"human"`
+		} `json:"createUser"`
 	}
 	if err := c.do(ctx, http.MethodPost, "/v2/idp_intents/"+url.PathEscape(intentID), c.pat, body, &retrieved); err != nil {
 		return IDPInformation{}, err
 	}
 	info := IDPInformation{
-		IDPID:    retrieved.IDPInformation.IDPID,
-		UserID:   retrieved.IDPInformation.UserID,
-		UserName: retrieved.IDPInformation.UserName,
+		IDPID:        retrieved.IDPInformation.IDPID,
+		UserID:       retrieved.IDPInformation.UserID,
+		UserName:     retrieved.IDPInformation.UserName,
+		LinkedUserID: retrieved.UserID,
+		Email:        retrieved.AddHumanUser.Email.Email,
+		DisplayName:  retrieved.AddHumanUser.Profile.DisplayName,
 	}
-	if info.UserID == "" {
-		info.UserID = retrieved.UserID
+	if info.DisplayName == "" {
+		info.DisplayName = strings.TrimSpace(retrieved.AddHumanUser.Profile.GivenName + " " + retrieved.AddHumanUser.Profile.FamilyName)
+	}
+	if info.Email == "" {
+		info.Email = retrieved.CreateUser.Human.Email.Email
+	}
+	if info.DisplayName == "" {
+		info.DisplayName = retrieved.CreateUser.Human.Profile.DisplayName
+	}
+	if info.DisplayName == "" {
+		info.DisplayName = strings.TrimSpace(retrieved.CreateUser.Human.Profile.GivenName + " " + retrieved.CreateUser.Human.Profile.FamilyName)
 	}
 	return info, nil
 }
@@ -230,24 +269,44 @@ func (c *Client) ListIDPLinks(ctx context.Context, userID string) ([]IDPLink, er
 }
 
 func (c *Client) CreateHumanUser(ctx context.Context, username, email, password string) (CreatedUser, error) {
+	return c.createHumanUser(ctx, username, email, password, nil)
+}
+
+func (c *Client) CreateHumanUserWithIDPLink(
+	ctx context.Context,
+	username, email, password string,
+	link IDPLink,
+) (CreatedUser, error) {
+	return c.createHumanUser(ctx, username, email, password, &link)
+}
+
+func (c *Client) createHumanUser(ctx context.Context, username, email, password string, link *IDPLink) (CreatedUser, error) {
+	human := map[string]any{
+		"profile": map[string]string{
+			"givenName":   username,
+			"familyName":  username,
+			"displayName": username,
+		},
+		"email": map[string]any{
+			"email":    email,
+			"sendCode": map[string]any{},
+		},
+		"password": map[string]any{
+			"password":       password,
+			"changeRequired": false,
+		},
+	}
+	if link != nil {
+		human["idpLinks"] = []map[string]string{{
+			"idpId":    link.IDPID,
+			"userId":   link.UserID,
+			"userName": link.UserName,
+		}}
+	}
 	body := map[string]any{
 		"organizationId": c.organizationID,
 		"username":       username,
-		"human": map[string]any{
-			"profile": map[string]string{
-				"givenName":   username,
-				"familyName":  username,
-				"displayName": username,
-			},
-			"email": map[string]any{
-				"email":    email,
-				"sendCode": map[string]any{},
-			},
-			"password": map[string]any{
-				"password":       password,
-				"changeRequired": false,
-			},
-		},
+		"human":          human,
 	}
 	var created struct {
 		ID string `json:"id"`

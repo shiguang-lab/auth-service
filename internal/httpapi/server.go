@@ -87,6 +87,9 @@ func (s *Server) Handler() http.Handler {
 			auth.Post("/api/auth/register", s.login.Register)
 			auth.Get("/api/auth/register/provider", s.login.Start)
 			auth.Get("/api/auth/oidc/callback", s.login.Callback)
+			auth.Get("/api/auth/idp-links/start", s.login.StartIDPLink)
+			auth.Get("/api/auth/idp-links/callback", s.login.IDPLinkCallback)
+			auth.Get("/api/auth/idp-links", s.login.ListIDPLinks)
 			auth.Get("/api/auth/session", s.login.Session)
 			auth.Post("/api/auth/logout", s.login.Logout)
 			if s.orgs != nil {

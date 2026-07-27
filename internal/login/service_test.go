@@ -285,7 +285,7 @@ func TestRegisterMapsDuplicateUserToConflict(t *testing.T) {
 }
 
 func newDirectLoginTestService() (*Service, *fakeTransactionRepository, *fakeZitadelSessionClient, *session.MemoryStore) {
-	transactions := &fakeTransactionRepository{attempts: make(map[string]loginAttempt)}
+	transactions := &fakeTransactionRepository{attempts: make(map[string]loginAttempt), links: make(map[string]linkTransaction)}
 	upstream := &fakeZitadelSessionClient{}
 	sessions := session.NewMemoryStore()
 	return &Service{
@@ -313,6 +313,7 @@ type fakeTransactionRepository struct {
 	mu           sync.Mutex
 	attempts     map[string]loginAttempt
 	transactions map[string]transaction
+	links        map[string]linkTransaction
 }
 
 func (f *fakeTransactionRepository) putTransaction(_ context.Context, value transaction) error {
@@ -339,6 +340,33 @@ func (f *fakeTransactionRepository) deleteTransaction(_ context.Context, id stri
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.transactions, id)
+	return nil
+}
+
+func (f *fakeTransactionRepository) putLinkTransaction(_ context.Context, value linkTransaction) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.links == nil {
+		f.links = make(map[string]linkTransaction)
+	}
+	f.links[value.State] = value
+	return nil
+}
+
+func (f *fakeTransactionRepository) getLinkTransaction(_ context.Context, id string) (linkTransaction, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	value, ok := f.links[id]
+	if !ok {
+		return linkTransaction{}, errTransactionNotFound
+	}
+	return value, nil
+}
+
+func (f *fakeTransactionRepository) deleteLinkTransaction(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.links, id)
 	return nil
 }
 
@@ -381,6 +409,11 @@ type fakeZitadelSessionClient struct {
 	createdUsername string
 	createdEmail    string
 	createdPassword string
+	intentURL       string
+	intentInfo      zitadel.IDPInformation
+	links           []zitadel.IDPLink
+	addedUserID     string
+	addedLink       zitadel.IDPLink
 }
 
 func (f *fakeZitadelSessionClient) ListAuthorizations(
@@ -413,6 +446,37 @@ func (f *fakeZitadelSessionClient) CreateHumanUser(_ context.Context, username, 
 		return zitadel.CreatedUser{}, f.err
 	}
 	return zitadel.CreatedUser{ID: "created-user"}, nil
+}
+
+func (f *fakeZitadelSessionClient) StartIdentityProviderIntent(context.Context, string, string, string) (string, error) {
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.intentURL, nil
+}
+
+func (f *fakeZitadelSessionClient) RetrieveIdentityProviderIntent(context.Context, string, string) (zitadel.IDPInformation, error) {
+	if f.err != nil {
+		return zitadel.IDPInformation{}, f.err
+	}
+	return f.intentInfo, nil
+}
+
+func (f *fakeZitadelSessionClient) AddIDPLink(_ context.Context, userID string, link zitadel.IDPLink) error {
+	f.addedUserID = userID
+	f.addedLink = link
+	if f.err != nil {
+		return f.err
+	}
+	f.links = append(f.links, link)
+	return nil
+}
+
+func (f *fakeZitadelSessionClient) ListIDPLinks(context.Context, string) ([]zitadel.IDPLink, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return append([]zitadel.IDPLink(nil), f.links...), nil
 }
 
 var _ transactionRepository = (*fakeTransactionRepository)(nil)

@@ -51,6 +51,9 @@ type transactionRepository interface {
 	putTransaction(context.Context, transaction) error
 	getTransaction(context.Context, string) (transaction, error)
 	deleteTransaction(context.Context, string) error
+	putLinkTransaction(context.Context, linkTransaction) error
+	getLinkTransaction(context.Context, string) (linkTransaction, error)
+	deleteLinkTransaction(context.Context, string) error
 	putAttempt(context.Context, string, loginAttempt) error
 	takeAttempt(context.Context, string) (loginAttempt, error)
 	allowAttempt(context.Context, string) (bool, error)
@@ -63,6 +66,10 @@ type zitadelSessionClient interface {
 	DeleteSession(context.Context, string, string) error
 	CreateHumanUser(context.Context, string, string, string) (zitadel.CreatedUser, error)
 	ListAuthorizations(context.Context, zitadel.AuthorizationFilter) ([]zitadel.Authorization, error)
+	StartIdentityProviderIntent(context.Context, string, string, string) (string, error)
+	RetrieveIdentityProviderIntent(context.Context, string, string) (zitadel.IDPInformation, error)
+	AddIDPLink(context.Context, string, zitadel.IDPLink) error
+	ListIDPLinks(context.Context, string) ([]zitadel.IDPLink, error)
 }
 
 type identityClaims struct {
@@ -389,45 +396,51 @@ func (s *Service) Password(response http.ResponseWriter, request *http.Request) 
 }
 
 func (s *Service) Callback(response http.ResponseWriter, request *http.Request) {
-	if oidcError := request.URL.Query().Get("error"); oidcError != "" {
-		writeJSON(response, http.StatusUnauthorized, map[string]string{"error": "oidc_failed"})
+	state := request.URL.Query().Get("state")
+	tx, err := s.transactions.getTransaction(request.Context(), state)
+	if err != nil {
+		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid_callback"})
 		return
 	}
-	state := request.URL.Query().Get("state")
+	_ = s.transactions.deleteTransaction(request.Context(), state)
+	if oidcError := request.URL.Query().Get("error"); oidcError != "" {
+		s.redirectOIDCResult(response, request, tx.ReturnTo, "error")
+		return
+	}
 	code := request.URL.Query().Get("code")
-	tx, err := s.transactions.getTransaction(request.Context(), state)
-	if err != nil || code == "" {
-		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid_callback"})
+	if code == "" {
+		s.redirectOIDCResult(response, request, tx.ReturnTo, "error")
 		return
 	}
 	oauthConfig, verifier, oidcHTTP, err := s.oidcConfiguration(request.Context())
 	if err != nil {
-		s.serverError(response, err)
+		s.logger.Error("configure OIDC callback", "error", err)
+		s.redirectOIDCResult(response, request, tx.ReturnTo, "error")
 		return
 	}
 	ctx := oidc.ClientContext(request.Context(), oidcHTTP)
 	token, err := oauthConfig.Exchange(ctx, code, oauth2.VerifierOption(tx.PKCEVerifier))
 	if err != nil {
-		s.serverError(response, fmt.Errorf("exchange OIDC code: %w", err))
+		s.redirectOIDCResult(response, request, tx.ReturnTo, "error")
 		return
 	}
 	rawIDToken, ok := token.Extra("id_token").(string)
 	if !ok {
-		s.serverError(response, errors.New("OIDC response does not include an ID token"))
+		s.redirectOIDCResult(response, request, tx.ReturnTo, "error")
 		return
 	}
 	idToken, err := verifier.Verify(ctx, rawIDToken)
 	if err != nil {
-		s.serverError(response, fmt.Errorf("verify OIDC ID token: %w", err))
+		s.redirectOIDCResult(response, request, tx.ReturnTo, "error")
 		return
 	}
 	var claims identityClaims
 	if err := idToken.Claims(&claims); err != nil {
-		s.serverError(response, fmt.Errorf("decode OIDC claims: %w", err))
+		s.redirectOIDCResult(response, request, tx.ReturnTo, "error")
 		return
 	}
 	if !constantEqual(claims.Nonce, tx.Nonce) || claims.Subject == "" {
-		writeJSON(response, http.StatusUnauthorized, map[string]string{"error": "invalid_identity"})
+		s.redirectOIDCResult(response, request, tx.ReturnTo, "error")
 		return
 	}
 	now := time.Now().UTC()
@@ -437,7 +450,8 @@ func (s *Service) Callback(response http.ResponseWriter, request *http.Request) 
 	}
 	sessionID, err := randomValue(32)
 	if err != nil {
-		s.serverError(response, err)
+		s.logger.Error("create federated session", "error", err)
+		s.redirectOIDCResult(response, request, tx.ReturnTo, "error")
 		return
 	}
 	// The business context always starts personal: the ZITADEL resident
@@ -456,12 +470,139 @@ func (s *Service) Callback(response http.ResponseWriter, request *http.Request) 
 		LastSeenAt:            now,
 	}
 	if err := s.sessions.Put(request.Context(), sessionID, value); err != nil {
+		s.logger.Error("store federated session", "error", err)
+		s.redirectOIDCResult(response, request, tx.ReturnTo, "error")
+		return
+	}
+	s.setSessionCookie(response, sessionID, int(s.cfg.AbsoluteTTL.Seconds()))
+	s.redirectOIDCResult(response, request, tx.ReturnTo, "success")
+}
+
+// StartIDPLink begins a server-bound account linking transaction. The current
+// session subject is never taken from a browser-controlled query parameter.
+func (s *Service) StartIDPLink(response http.ResponseWriter, request *http.Request) {
+	value, _, err := s.currentSession(request)
+	if err != nil || value.Subject == "" {
+		http.Redirect(response, request, strings.TrimRight(s.cfg.PublicOrigin, "/")+"/login", http.StatusFound)
+		return
+	}
+	provider := strings.ToLower(strings.TrimSpace(request.URL.Query().Get("provider")))
+	providerID, ok := s.cfg.OIDCProviderIDs[provider]
+	if !ok {
+		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "unsupported_provider"})
+		return
+	}
+	state, err := randomValue(32)
+	if err != nil {
 		s.serverError(response, err)
 		return
 	}
-	_ = s.transactions.deleteTransaction(request.Context(), state)
-	s.setSessionCookie(response, sessionID, int(s.cfg.AbsoluteTTL.Seconds()))
-	http.Redirect(response, request, tx.ReturnTo, http.StatusFound)
+	returnTo := s.safeReturnTo(request.URL.Query().Get("return_to"))
+	if !strings.HasPrefix(returnTo, "/") || strings.HasPrefix(returnTo, "//") {
+		returnTo = "/account"
+	}
+	if err := s.transactions.putLinkTransaction(request.Context(), linkTransaction{
+		State: state, Subject: value.Subject, Provider: provider, ReturnTo: returnTo, CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		s.serverError(response, err)
+		return
+	}
+	callback := strings.TrimRight(s.cfg.PublicOrigin, "/") + "/api/auth/idp-links/callback?state=" + url.QueryEscape(state)
+	failure := strings.TrimRight(s.cfg.PublicOrigin, "/") + "/account?link_status=error&provider=" + url.QueryEscape(provider)
+	authURL, err := s.zitadel.StartIdentityProviderIntent(request.Context(), providerID, callback, failure)
+	if err != nil {
+		_ = s.transactions.deleteLinkTransaction(request.Context(), state)
+		s.serverError(response, err)
+		return
+	}
+	http.Redirect(response, request, authURL, http.StatusFound)
+}
+
+func (s *Service) IDPLinkCallback(response http.ResponseWriter, request *http.Request) {
+	state := request.URL.Query().Get("state")
+	tx, err := s.transactions.getLinkTransaction(request.Context(), state)
+	if err != nil {
+		http.Redirect(response, request, strings.TrimRight(s.cfg.PublicOrigin, "/")+"/account?link_status=error", http.StatusFound)
+		return
+	}
+	_ = s.transactions.deleteLinkTransaction(request.Context(), state)
+	if request.URL.Query().Get("error") != "" {
+		http.Redirect(response, request, s.linkResultURL(tx.ReturnTo, tx.Provider, "error"), http.StatusFound)
+		return
+	}
+	intentID := firstNonEmpty(request.URL.Query().Get("idp_intent_id"), request.URL.Query().Get("idpIntentId"))
+	intentToken := firstNonEmpty(request.URL.Query().Get("idp_intent_token"), request.URL.Query().Get("idpIntentToken"))
+	if intentID == "" || intentToken == "" {
+		http.Redirect(response, request, s.linkResultURL(tx.ReturnTo, tx.Provider, "error"), http.StatusFound)
+		return
+	}
+	info, err := s.zitadel.RetrieveIdentityProviderIntent(request.Context(), intentID, intentToken)
+	expectedID := s.cfg.OIDCProviderIDs[tx.Provider]
+	if err != nil || info.IDPID != expectedID || info.UserID == "" {
+		http.Redirect(response, request, s.linkResultURL(tx.ReturnTo, tx.Provider, "error"), http.StatusFound)
+		return
+	}
+	if err := s.zitadel.AddIDPLink(request.Context(), tx.Subject, zitadel.IDPLink{IDPID: info.IDPID, UserID: info.UserID, UserName: info.UserName}); err != nil {
+		if apiErr, ok := err.(*zitadel.APIError); ok && apiErr.StatusCode == http.StatusConflict {
+			http.Redirect(response, request, s.linkResultURL(tx.ReturnTo, tx.Provider, "conflict"), http.StatusFound)
+			return
+		}
+		http.Redirect(response, request, s.linkResultURL(tx.ReturnTo, tx.Provider, "error"), http.StatusFound)
+		return
+	}
+	http.Redirect(response, request, s.linkResultURL(tx.ReturnTo, tx.Provider, "success"), http.StatusFound)
+}
+
+func (s *Service) ListIDPLinks(response http.ResponseWriter, request *http.Request) {
+	value, _, err := s.currentSession(request)
+	if err != nil || value.Subject == "" {
+		writeJSON(response, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	links, err := s.zitadel.ListIDPLinks(request.Context(), value.Subject)
+	if err != nil {
+		s.serverError(response, err)
+		return
+	}
+	result := make([]map[string]string, 0, len(links))
+	for _, link := range links {
+		provider := ""
+		for name, id := range s.cfg.OIDCProviderIDs {
+			if id == link.IDPID {
+				provider = name
+				break
+			}
+		}
+		if provider == "" {
+			continue
+		}
+		result = append(result, map[string]string{"provider": provider, "userId": link.UserID, "userName": link.UserName})
+	}
+	writeJSON(response, http.StatusOK, map[string]any{"links": result})
+}
+
+func (s *Service) linkResultURL(returnTo, provider, status string) string {
+	if !strings.HasPrefix(returnTo, "/") || strings.HasPrefix(returnTo, "//") {
+		return strings.TrimRight(s.cfg.PublicOrigin, "/") + "/account?link_status=" + url.QueryEscape(status) + "&provider=" + url.QueryEscape(provider)
+	}
+	separator := "?"
+	if strings.Contains(returnTo, "?") {
+		separator = "&"
+	}
+	return returnTo + separator + "link_status=" + url.QueryEscape(status) + "&provider=" + url.QueryEscape(provider)
+}
+
+func (s *Service) redirectOIDCResult(response http.ResponseWriter, request *http.Request, returnTo, status string) {
+	if strings.HasPrefix(returnTo, "/") && !strings.HasPrefix(returnTo, "//") {
+		location := "/auth/callback?status=" + url.QueryEscape(status) + "&return_to=" + url.QueryEscape(returnTo)
+		http.Redirect(response, request, location, http.StatusFound)
+		return
+	}
+	if status == "success" {
+		http.Redirect(response, request, returnTo, http.StatusFound)
+		return
+	}
+	writeJSON(response, http.StatusUnauthorized, map[string]string{"error": "oidc_failed"})
 }
 
 func (s *Service) Session(response http.ResponseWriter, request *http.Request) {

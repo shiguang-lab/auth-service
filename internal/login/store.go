@@ -23,6 +23,14 @@ type transaction struct {
 	CreatedAt    time.Time `json:"created_at"`
 }
 
+type linkTransaction struct {
+	State     string    `json:"state"`
+	Subject   string    `json:"subject"`
+	Provider  string    `json:"provider"`
+	ReturnTo  string    `json:"return_to"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 type loginAttempt struct {
 	CSRFToken string    `json:"csrf_token"`
 	ReturnTo  string    `json:"return_to"`
@@ -63,6 +71,22 @@ func (s *transactionStore) getTransaction(ctx context.Context, state string) (tr
 
 func (s *transactionStore) deleteTransaction(ctx context.Context, state string) error {
 	return s.client.Del(ctx, s.key("tx:", state)).Err()
+}
+
+func (s *transactionStore) putLinkTransaction(ctx context.Context, value linkTransaction) error {
+	return s.put(ctx, "link:", value.State, value, s.ttl)
+}
+
+func (s *transactionStore) getLinkTransaction(ctx context.Context, state string) (linkTransaction, error) {
+	var value linkTransaction
+	if err := s.get(ctx, "link:", state, &value); err != nil {
+		return linkTransaction{}, err
+	}
+	return value, nil
+}
+
+func (s *transactionStore) deleteLinkTransaction(ctx context.Context, state string) error {
+	return s.client.Del(ctx, s.key("link:", state)).Err()
 }
 
 func (s *transactionStore) putAttempt(ctx context.Context, transactionID string, value loginAttempt) error {

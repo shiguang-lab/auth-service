@@ -75,6 +75,18 @@ type User struct {
 	State       string
 }
 
+type IDPLink struct {
+	IDPID    string
+	UserID   string
+	UserName string
+}
+
+type IDPInformation struct {
+	IDPID    string
+	UserID   string
+	UserName string
+}
+
 type APIError struct {
 	StatusCode int
 }
@@ -136,6 +148,85 @@ func (c *Client) DeleteSession(ctx context.Context, id, token string) error {
 		return nil
 	}
 	return c.do(ctx, http.MethodDelete, "/v2/sessions/"+url.PathEscape(id), token, nil, nil)
+}
+
+// StartIdentityProviderIntent starts ZITADEL's authenticated external-identity flow.
+// The intent callback returns a short-lived token that must be retrieved before linking.
+func (c *Client) StartIdentityProviderIntent(ctx context.Context, idpID, successURL, failureURL string) (string, error) {
+	body := map[string]any{
+		"idpId": idpID,
+		"urls": map[string]string{
+			"successUrl": successURL,
+			"failureUrl": failureURL,
+		},
+	}
+	var started struct {
+		AuthURL string `json:"authUrl"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/v2/idp_intents", c.pat, body, &started); err != nil {
+		return "", err
+	}
+	if started.AuthURL == "" {
+		return "", errors.New("ZITADEL IDP intent did not return an auth URL")
+	}
+	return started.AuthURL, nil
+}
+
+func (c *Client) RetrieveIdentityProviderIntent(ctx context.Context, intentID, intentToken string) (IDPInformation, error) {
+	body := map[string]string{
+		"idpIntentId":    intentID,
+		"idpIntentToken": intentToken,
+	}
+	var retrieved struct {
+		IDPInformation struct {
+			IDPID    string `json:"idpId"`
+			UserID   string `json:"userId"`
+			UserName string `json:"userName"`
+		} `json:"idpInformation"`
+		UserID string `json:"userId"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/v2/idp_intents/"+url.PathEscape(intentID), c.pat, body, &retrieved); err != nil {
+		return IDPInformation{}, err
+	}
+	info := IDPInformation{
+		IDPID:    retrieved.IDPInformation.IDPID,
+		UserID:   retrieved.IDPInformation.UserID,
+		UserName: retrieved.IDPInformation.UserName,
+	}
+	if info.UserID == "" {
+		info.UserID = retrieved.UserID
+	}
+	return info, nil
+}
+
+func (c *Client) AddIDPLink(ctx context.Context, userID string, link IDPLink) error {
+	body := map[string]any{
+		"userId": userID,
+		"idpLink": map[string]string{
+			"idpId":    link.IDPID,
+			"userId":   link.UserID,
+			"userName": link.UserName,
+		},
+	}
+	return c.do(ctx, http.MethodPost, "/v2/users/"+url.PathEscape(userID)+"/links", c.pat, body, nil)
+}
+
+func (c *Client) ListIDPLinks(ctx context.Context, userID string) ([]IDPLink, error) {
+	var found struct {
+		Result []struct {
+			IDPID    string `json:"idpId"`
+			UserID   string `json:"userId"`
+			UserName string `json:"userName"`
+		} `json:"result"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/v2/users/"+url.PathEscape(userID)+"/links/_search", c.pat, map[string]any{}, &found); err != nil {
+		return nil, err
+	}
+	links := make([]IDPLink, 0, len(found.Result))
+	for _, item := range found.Result {
+		links = append(links, IDPLink{IDPID: item.IDPID, UserID: item.UserID, UserName: item.UserName})
+	}
+	return links, nil
 }
 
 func (c *Client) CreateHumanUser(ctx context.Context, username, email, password string) (CreatedUser, error) {

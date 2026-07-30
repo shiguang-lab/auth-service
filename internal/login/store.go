@@ -34,9 +34,13 @@ type linkTransaction struct {
 }
 
 type loginAttempt struct {
-	CSRFToken string    `json:"csrf_token"`
-	ReturnTo  string    `json:"return_to"`
-	CreatedAt time.Time `json:"created_at"`
+	CSRFToken             string    `json:"csrf_token"`
+	ReturnTo              string    `json:"return_to"`
+	Email                 string    `json:"email,omitempty"`
+	OTPSessionID          string    `json:"otp_session_id,omitempty"`
+	OTPSessionToken       string    `json:"otp_session_token,omitempty"`
+	OTPChallengeRequested bool      `json:"otp_challenge_requested,omitempty"`
+	CreatedAt             time.Time `json:"created_at"`
 }
 
 type federatedRegistration struct {
@@ -108,12 +112,24 @@ func (s *transactionStore) putAttempt(ctx context.Context, transactionID string,
 	return s.put(ctx, "attempt:", transactionID, value, s.ttl)
 }
 
+func (s *transactionStore) getAttempt(ctx context.Context, transactionID string) (loginAttempt, error) {
+	var value loginAttempt
+	if err := s.get(ctx, "attempt:", transactionID, &value); err != nil {
+		return loginAttempt{}, err
+	}
+	return value, nil
+}
+
 func (s *transactionStore) takeAttempt(ctx context.Context, transactionID string) (loginAttempt, error) {
 	var value loginAttempt
 	if err := s.take(ctx, "attempt:", transactionID, &value); err != nil {
 		return loginAttempt{}, err
 	}
 	return value, nil
+}
+
+func (s *transactionStore) deleteAttempt(ctx context.Context, transactionID string) error {
+	return s.client.Del(ctx, s.key("attempt:", transactionID)).Err()
 }
 
 func (s *transactionStore) putFederatedRegistration(ctx context.Context, value federatedRegistration) error {

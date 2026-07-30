@@ -80,9 +80,15 @@ func (s *Server) Handler() http.Handler {
 	if s.login != nil {
 		router.Group(func(auth chi.Router) {
 			auth.Use(s.authenticateGateway)
+			auth.Get("/api/auth/providers/feishu/authorize", s.login.FeishuAuthorize)
+			auth.Post("/api/auth/providers/feishu/token", s.login.FeishuToken)
+			auth.Get("/api/auth/providers/feishu/userinfo", s.login.FeishuUserInfo)
 			auth.Get("/api/auth/federated/start", s.login.Start)
 			auth.Post("/api/auth/login/context", s.login.Context)
 			auth.Post("/api/auth/login/password", s.login.Password)
+			auth.Post("/api/auth/login/email/code", s.login.SendEmailCode)
+			auth.Post("/api/auth/login/email/verify", s.login.VerifyEmailCode)
+			auth.Get("/api/auth/login/email/callback", s.login.EmailCodeCallback)
 			auth.Post("/api/auth/register/context", s.login.RegistrationContext)
 			auth.Post("/api/auth/register", s.login.Register)
 			auth.Get("/api/auth/register/provider", s.login.Start)
@@ -93,6 +99,9 @@ func (s *Server) Handler() http.Handler {
 			auth.Get("/api/auth/idp-links/callback", s.login.IDPLinkCallback)
 			auth.Get("/api/auth/idp-links", s.login.ListIDPLinks)
 			auth.Get("/api/auth/session", s.login.Session)
+			auth.Get("/api/account/profile", s.login.Profile)
+			auth.Patch("/api/account/profile", s.login.UpdateProfile)
+			auth.Post("/api/account/avatar", s.login.UploadAvatar)
 			auth.Post("/api/auth/logout", s.login.Logout)
 			if s.orgs != nil {
 				auth.Post("/api/auth/context", s.orgs.SwitchContextHandler)

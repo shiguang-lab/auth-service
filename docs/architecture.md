@@ -41,6 +41,10 @@
 
 External identity providers are separate: they use Authorization Code + PKCE
 through `/api/auth/federated/start` and `/api/auth/oidc/callback`.
+Feishu additionally passes through three stateless compatibility endpoints that
+translate ZITADEL's generic OAuth requests to Feishu's current JSON APIs. They
+validate the public Feishu App ID and never persist the Feishu App Secret,
+authorization code, or access token.
 
 ## Token separation
 

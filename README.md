@@ -34,6 +34,7 @@ the shared browser cookie or ZITADEL tokens.
 - Public JWKS, liveness, and Redis-backed readiness
 - Direct ZITADEL Session API username/password authentication with no browser OIDC round trip
 - ZITADEL IDP Intent callbacks for GitHub/Google; existing links sign in directly and new identities continue in Website's custom registration page
+- Feishu OAuth login through a ZITADEL generic provider and Auth Service's current-API compatibility adapter
 - Parent-domain opaque session creation, inspection, and logout
 - Origin validation, CSRF protection, and Redis login rate limiting
 
@@ -71,6 +72,9 @@ IDs in `deploy/oidc-providers.env` and the corresponding provider registrations.
 | `GET` | `/.well-known/jwks.json` | Public |
 | `GET` | `/v1/forward-auth` | `X-SG-Gateway-Token` |
 | `GET` | `/api/auth/federated/start` | Gateway token; federated login only |
+| `GET` | `/api/auth/providers/feishu/authorize` | Gateway token; ZITADEL-to-Feishu authorization adapter |
+| `POST` | `/api/auth/providers/feishu/token` | Gateway token; ZITADEL-to-Feishu token adapter |
+| `GET` | `/api/auth/providers/feishu/userinfo` | Gateway token; Feishu user-info normalization |
 | `GET` | `/api/auth/register/provider` | Gateway token; starts Website-owned federated registration |
 | `POST` | `/api/auth/login/context` | Gateway token + Origin |
 | `POST` | `/api/auth/login/password` | Gateway token + Origin + CSRF |
@@ -102,3 +106,15 @@ the registered redirect URI
 `https://shiguanglab.com/api/auth/oidc/callback` before deploying. Existing
 applications are not recreated automatically because doing so would rotate the
 client credentials.
+
+### Feishu provider
+
+Feishu is registered as an organization-level generic OAuth provider. Its App
+Secret belongs only in the ignored `deploy/feishu-oauth.env` file; Auth Service
+receives only the generated, non-secret `FEISHU_IDP_ID` and `FEISHU_APP_ID`
+from `deploy/feishu-provider.env`. The App ID binds the compatibility adapter
+to this Feishu application without exposing the App Secret to Auth Service.
+
+Follow [docs/feishu-login.md](docs/feishu-login.md) to configure the Feishu
+redirect URL, bootstrap or rotate the ZITADEL provider, restart the service,
+and verify both first-time registration and returning-user login.

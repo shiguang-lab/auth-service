@@ -170,6 +170,7 @@ auth-service 会校验 `Origin` 必须是第一方来源(你的产品域名需�
 | 方法 | 路径 | 用途 | 成功响应(要点) |
 |---|---|---|---|
 | GET | `/api/auth/session` | 会话回显 | `{authenticated, subject, displayName, email, organization:{id,name}\|null, roles, platformRoles, entitlements}` |
+| GET | `/api/account/profile` | 当前用户权威资料(ZITADEL) | `{id,loginName,displayName,givenName,familyName,nickName,preferredLanguage,gender,email,emailVerified,phone,phoneVerified,state}` |
 | POST | `/api/auth/context` | 切换上下文,body `{organizationId}`(空串=个人) | `{organization, roles}`;非成员 404 |
 | POST | `/api/auth/logout` | 统一登出(清共享 cookie + 吊销上游会话) | `{redirect}` |
 | GET | `/api/account/orgs` | 我的组织列表 | `{organizations:[{id,name,roles}]}` |

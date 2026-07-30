@@ -30,6 +30,7 @@ services:
     env_file:
       - ./auth.env
       - ./oidc-providers.env
+      - ./feishu-provider.env
       - ./zitadel-oidc.env
     depends_on:
       redis:

@@ -3,6 +3,7 @@ package zitadel
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,8 +32,17 @@ type Session struct {
 	DisplayName string
 }
 
+type EmailOTPChallenge struct {
+	SessionID    string
+	SessionToken string
+}
+
 type createSessionResponse struct {
 	SessionID    string `json:"sessionId"`
+	SessionToken string `json:"sessionToken"`
+}
+
+type setSessionResponse struct {
 	SessionToken string `json:"sessionToken"`
 }
 
@@ -68,11 +78,19 @@ type Authorization struct {
 }
 
 type User struct {
-	ID          string
-	LoginName   string
-	DisplayName string
-	Email       string
-	State       string
+	ID                string
+	LoginName         string
+	DisplayName       string
+	GivenName         string
+	FamilyName        string
+	NickName          string
+	PreferredLanguage string
+	Gender            string
+	Email             string
+	EmailVerified     bool
+	Phone             string
+	PhoneVerified     bool
+	State             string
 }
 
 type IDPLink struct {
@@ -140,6 +158,74 @@ func (c *Client) PasswordSession(ctx context.Context, loginName, password string
 	return Session{
 		ID:          created.SessionID,
 		Token:       created.SessionToken,
+		Subject:     current.Session.Factors.User.ID,
+		LoginName:   current.Session.Factors.User.LoginName,
+		DisplayName: current.Session.Factors.User.DisplayName,
+	}, nil
+}
+
+// StartEmailOTP resolves the human user by primary email and asks ZITADEL to
+// deliver an OTP through the instance's configured SMTP provider.
+func (c *Client) StartEmailOTP(ctx context.Context, email, urlTemplate string) (EmailOTPChallenge, error) {
+	user, err := c.GetUserByEmail(ctx, email)
+	if err != nil {
+		return EmailOTPChallenge{}, err
+	}
+	if err := c.ensureEmailOTP(ctx, user.ID); err != nil {
+		return EmailOTPChallenge{}, err
+	}
+	body := map[string]any{
+		"checks": map[string]any{
+			"user": map[string]string{"userId": user.ID},
+		},
+		"challenges": map[string]any{
+			"otpEmail": map[string]any{
+				"sendCode": map[string]any{"urlTemplate": urlTemplate},
+			},
+		},
+	}
+	var created createSessionResponse
+	if err := c.do(ctx, http.MethodPost, "/v2/sessions", c.pat, body, &created); err != nil {
+		return EmailOTPChallenge{}, err
+	}
+	if created.SessionID == "" || created.SessionToken == "" {
+		return EmailOTPChallenge{}, errors.New("ZITADEL email OTP challenge did not return a session")
+	}
+	return EmailOTPChallenge{SessionID: created.SessionID, SessionToken: created.SessionToken}, nil
+}
+
+func (c *Client) ensureEmailOTP(ctx context.Context, userID string) error {
+	err := c.do(ctx, http.MethodPost, "/v2/users/"+url.PathEscape(userID)+"/otp_email", c.pat, map[string]any{}, nil)
+	var apiError *APIError
+	if errors.As(err, &apiError) && apiError.StatusCode == http.StatusConflict {
+		return nil
+	}
+	return err
+}
+
+// VerifyEmailOTP checks the one-time code and returns the fully populated
+// ZITADEL session using the rotated token returned by SetSession.
+func (c *Client) VerifyEmailOTP(ctx context.Context, sessionID, code string) (Session, error) {
+	body := map[string]any{
+		"checks": map[string]any{
+			"otpEmail": map[string]string{"code": code},
+		},
+	}
+	var updated setSessionResponse
+	if err := c.do(ctx, http.MethodPatch, "/v2/sessions/"+url.PathEscape(sessionID), c.pat, body, &updated); err != nil {
+		return Session{}, err
+	}
+	if updated.SessionToken == "" {
+		return Session{}, errors.New("ZITADEL email OTP verification did not return a session token")
+	}
+
+	var current getSessionResponse
+	if err := c.do(ctx, http.MethodGet, "/v2/sessions/"+url.PathEscape(sessionID), updated.SessionToken, nil, &current); err != nil {
+		return Session{}, err
+	}
+	return Session{
+		ID:          sessionID,
+		Token:       updated.SessionToken,
 		Subject:     current.Session.Factors.User.ID,
 		LoginName:   current.Session.Factors.User.LoginName,
 		DisplayName: current.Session.Factors.User.DisplayName,
@@ -240,7 +326,6 @@ func (c *Client) RetrieveIdentityProviderIntent(ctx context.Context, intentID, i
 
 func (c *Client) AddIDPLink(ctx context.Context, userID string, link IDPLink) error {
 	body := map[string]any{
-		"userId": userID,
 		"idpLink": map[string]string{
 			"idpId":    link.IDPID,
 			"userId":   link.UserID,
@@ -490,6 +575,87 @@ func (c *Client) GetUserByLoginName(ctx context.Context, loginName string) (User
 	return users[0], nil
 }
 
+// GetUserByEmail resolves one human user by an exact primary email address.
+func (c *Client) GetUserByEmail(ctx context.Context, email string) (User, error) {
+	body := map[string]any{
+		"queries": []map[string]any{
+			{"emailQuery": map[string]any{"emailAddress": email, "method": "TEXT_QUERY_METHOD_EQUALS_IGNORE_CASE"}},
+		},
+	}
+	users, err := c.searchUsers(ctx, body)
+	if err != nil {
+		return User{}, err
+	}
+	if len(users) == 0 {
+		return User{}, &APIError{StatusCode: http.StatusNotFound}
+	}
+	return users[0], nil
+}
+
+// GetUserByID resolves the canonical profile for one ZITADEL user.
+func (c *Client) GetUserByID(ctx context.Context, userID string) (User, error) {
+	users, err := c.SearchUsersByIDs(ctx, []string{userID})
+	if err != nil {
+		return User{}, err
+	}
+	for _, user := range users {
+		if user.ID == userID {
+			return user, nil
+		}
+	}
+	return User{}, &APIError{StatusCode: http.StatusNotFound}
+}
+
+// UpdateHumanUser updates the profile fields of a human user via ZITADEL's
+// v2 users API.
+func (c *Client) UpdateHumanUser(ctx context.Context, userID string, profile map[string]any) error {
+	body := map[string]any{}
+	if p, ok := profile["profile"].(map[string]any); ok {
+		body["human"] = map[string]any{"profile": p}
+		if email, ok := profile["email"].(string); ok && email != "" {
+			body["human"].(map[string]any)["email"] = map[string]string{"email": email}
+		}
+		if phone, ok := profile["phone"].(string); ok && phone != "" {
+			body["human"].(map[string]any)["phone"] = map[string]string{"phone": phone}
+		}
+	}
+	return c.do(ctx, http.MethodPut, "/v2/users/"+url.PathEscape(userID), c.pat, body, nil)
+}
+
+// SetUserMetadata stores a key-value pair as ZITADEL user metadata.
+func (c *Client) SetUserMetadata(ctx context.Context, userID, key, value string) error {
+	body := map[string]any{
+		"metadata": []map[string]string{{
+			"key":   key,
+			"value": value,
+		}},
+	}
+	return c.do(ctx, http.MethodPost, "/v2/users/"+url.PathEscape(userID)+"/metadata", c.pat, body, nil)
+}
+
+// GetUserMetadata retrieves all metadata for a user and returns the value for the given key.
+func (c *Client) GetUserMetadata(ctx context.Context, userID, key string) (string, error) {
+	var found struct {
+		Result []struct {
+			Key   string `json:"key"`
+			Value string `json:"value"`
+		} `json:"result"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/v2/users/"+url.PathEscape(userID)+"/metadata/_search", c.pat, map[string]any{}, &found); err != nil {
+		return "", err
+	}
+	for _, item := range found.Result {
+		decoded, err := base64.StdEncoding.DecodeString(item.Value)
+		if err != nil {
+			continue
+		}
+		if item.Key == key {
+			return string(decoded), nil
+		}
+	}
+	return "", nil
+}
+
 // SearchUsersByIDs resolves display information for the given user ids.
 func (c *Client) SearchUsersByIDs(ctx context.Context, ids []string) ([]User, error) {
 	if len(ids) == 0 {
@@ -519,11 +685,21 @@ func (c *Client) searchUsers(ctx context.Context, body map[string]any) ([]User, 
 			State              string `json:"state"`
 			Human              struct {
 				Profile struct {
-					DisplayName string `json:"displayName"`
+					DisplayName       string `json:"displayName"`
+					GivenName         string `json:"givenName"`
+					FamilyName        string `json:"familyName"`
+					NickName          string `json:"nickName"`
+					PreferredLanguage string `json:"preferredLanguage"`
+					Gender            string `json:"gender"`
 				} `json:"profile"`
 				Email struct {
-					Email string `json:"email"`
+					Email      string `json:"email"`
+					IsVerified bool   `json:"isVerified"`
 				} `json:"email"`
+				Phone struct {
+					Phone      string `json:"phone"`
+					IsVerified bool   `json:"isVerified"`
+				} `json:"phone"`
 			} `json:"human"`
 		} `json:"result"`
 	}
@@ -533,11 +709,19 @@ func (c *Client) searchUsers(ctx context.Context, body map[string]any) ([]User, 
 	users := make([]User, 0, len(found.Result))
 	for _, item := range found.Result {
 		users = append(users, User{
-			ID:          item.UserID,
-			LoginName:   item.PreferredLoginName,
-			DisplayName: item.Human.Profile.DisplayName,
-			Email:       item.Human.Email.Email,
-			State:       item.State,
+			ID:                item.UserID,
+			LoginName:         item.PreferredLoginName,
+			DisplayName:       item.Human.Profile.DisplayName,
+			GivenName:         item.Human.Profile.GivenName,
+			FamilyName:        item.Human.Profile.FamilyName,
+			NickName:          item.Human.Profile.NickName,
+			PreferredLanguage: item.Human.Profile.PreferredLanguage,
+			Gender:            item.Human.Profile.Gender,
+			Email:             item.Human.Email.Email,
+			EmailVerified:     item.Human.Email.IsVerified,
+			Phone:             item.Human.Phone.Phone,
+			PhoneVerified:     item.Human.Phone.IsVerified,
+			State:             item.State,
 		})
 	}
 	return users, nil

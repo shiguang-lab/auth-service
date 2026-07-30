@@ -73,3 +73,38 @@ func TestParseProviderIDsRejectsMalformedEntries(t *testing.T) {
 		})
 	}
 }
+
+func TestAddProviderID(t *testing.T) {
+	providers := map[string]string{"github": "github-idp"}
+	if err := addProviderID(providers, "feishu", "feishu-idp"); err != nil {
+		t.Fatal(err)
+	}
+	if providers["feishu"] != "feishu-idp" {
+		t.Fatalf("provider IDs = %#v", providers)
+	}
+	if err := addProviderID(providers, "feishu", "different-idp"); err == nil {
+		t.Fatal("expected a conflicting provider id to be rejected")
+	}
+}
+
+func TestFeishuProviderRequiresAppID(t *testing.T) {
+	cfg := Config{
+		Environment:       "development",
+		GatewayToken:      strings.Repeat("x", 32),
+		SessionBackend:    "memory",
+		SessionCookieName: "__Secure-sg_session",
+		IdentityIssuer:    "https://auth.shiguanglab.com",
+		SigningKeyID:      "key-1",
+		IdentityTokenTTL:  time.Minute,
+		IdleTTL:           time.Hour,
+		AbsoluteTTL:       24 * time.Hour,
+		OIDCProviderIDs:   map[string]string{"feishu": "feishu-idp"},
+	}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "FEISHU_APP_ID") {
+		t.Fatalf("expected missing Feishu app ID error, got %v", err)
+	}
+	cfg.FeishuAppID = "cli_example"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate Feishu provider config: %v", err)
+	}
+}

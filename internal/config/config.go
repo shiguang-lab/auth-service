@@ -14,6 +14,18 @@ import (
 var providerTokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 type Config struct {
+	// S3Endpoint is the MinIO/S3-compatible endpoint (host:port).
+	S3Endpoint string
+	// S3AccessKey is the MinIO access key.
+	S3AccessKey string
+	// S3SecretKey is the MinIO secret key.
+	S3SecretKey string
+	// S3Bucket is the S3 bucket name for avatar uploads.
+	S3Bucket string
+	// S3UseSSL indicates whether to use HTTPS for S3 connections.
+	S3UseSSL bool
+	// StaticBaseURL is the public-facing base URL for static resources (e.g. https://static.shiguanglab.com).
+	StaticBaseURL              string
 	Addr                       string
 	Environment                string
 	GatewayToken               string
@@ -35,6 +47,7 @@ type Config struct {
 	OIDCClientSecret           string
 	OIDCRedirectURL            string
 	OIDCProviderIDs            map[string]string
+	FeishuAppID                string
 	AllowedReturnOrigins       []string
 	DefaultEntitlements        []string
 	IdentityIssuer             string
@@ -66,6 +79,9 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	if err := addProviderID(providerIDs, "feishu", os.Getenv("FEISHU_IDP_ID")); err != nil {
+		return Config{}, err
+	}
 
 	cfg := Config{
 		Addr:                       envOr("AUTH_ADDR", ":8081"),
@@ -89,8 +105,15 @@ func Load() (Config, error) {
 		OIDCClientSecret:           strings.TrimSpace(os.Getenv("OIDC_CLIENT_SECRET")),
 		OIDCRedirectURL:            envOr("OIDC_REDIRECT_URL", "https://shiguanglab.com/api/auth/oidc/callback"),
 		OIDCProviderIDs:            providerIDs,
+		FeishuAppID:                strings.TrimSpace(os.Getenv("FEISHU_APP_ID")),
 		AllowedReturnOrigins:       splitCSV(envOr("ALLOWED_RETURN_ORIGINS", "https://shiguanglab.com,https://www.shiguanglab.com,https://opc.shiguanglab.com")),
 		DefaultEntitlements:        splitCSV(envOr("DEFAULT_ENTITLEMENTS", "superagents:access")),
+		S3Endpoint:                 envOr("SA_S3_ENDPOINT", "localhost:9000"),
+		S3AccessKey:                envOr("SA_S3_ACCESS_KEY", "opc"),
+		S3SecretKey:                os.Getenv("SA_S3_SECRET_KEY"),
+		S3Bucket:                   envOr("SA_S3_BUCKET", "opc-skills"),
+		S3UseSSL:                   envOr("SA_S3_SSL", "") == "true",
+		StaticBaseURL:              strings.TrimRight(envOr("STATIC_BASE_URL", "https://static.shiguanglab.com"), "/"),
 		IdentityIssuer:             envOr("IDENTITY_ISSUER", "https://auth.shiguanglab.com"),
 		SigningKeyFile:             strings.TrimSpace(os.Getenv("IDENTITY_SIGNING_KEY_FILE")),
 		SigningKeyID:               envOr("IDENTITY_KEY_ID", "dev-key"),
@@ -150,6 +173,12 @@ func (c Config) Validate() error {
 			return errors.New("IDENTITY_API_TOKEN must contain at least 32 characters in production")
 		}
 	}
+	if c.FeishuAppID != "" && !providerTokenPattern.MatchString(c.FeishuAppID) {
+		return errors.New("FEISHU_APP_ID contains invalid characters")
+	}
+	if _, enabled := c.OIDCProviderIDs["feishu"]; enabled && c.FeishuAppID == "" {
+		return errors.New("FEISHU_APP_ID is required when the Feishu identity provider is enabled")
+	}
 	for _, origin := range c.AllowedReturnOrigins {
 		parsed, err := url.Parse(origin)
 		validScheme := err == nil && (parsed.Scheme == "https" || (c.Environment != "production" && parsed.Scheme == "http"))
@@ -207,6 +236,21 @@ func parseProviderIDs(value string) (map[string]string, error) {
 		providerIDs[provider] = id
 	}
 	return providerIDs, nil
+}
+
+func addProviderID(providerIDs map[string]string, provider, value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	if !providerTokenPattern.MatchString(value) {
+		return fmt.Errorf("%s provider id %q is invalid", strings.ToUpper(provider), value)
+	}
+	if current, exists := providerIDs[provider]; exists && current != value {
+		return fmt.Errorf("provider %q is configured more than once", provider)
+	}
+	providerIDs[provider] = value
+	return nil
 }
 
 func envOr(name, fallback string) string {

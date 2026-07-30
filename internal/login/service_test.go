@@ -3,6 +3,7 @@ package login
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -87,12 +88,148 @@ func TestStartUsesZITADELIdentityProviderIntent(t *testing.T) {
 	}
 }
 
+func TestFeishuAuthorizeForwardsSupportedOAuthParameters(t *testing.T) {
+	service, _, _, _ := newDirectLoginTestService()
+	service.cfg.FeishuAppID = "client"
+	service.feishuURLs.Authorize = "https://accounts.example.test/authorize"
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"/api/auth/providers/feishu/authorize?client_id=client&redirect_uri=https%3A%2F%2Fsso.example.test%2Fidps%2Fcallback&response_type=code&state=state-1&prompt=select_account&code_challenge=challenge&code_challenge_method=S256",
+		nil,
+	)
+	response := httptest.NewRecorder()
+
+	service.FeishuAuthorize(response, request)
+
+	if response.Code != http.StatusFound {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	location, err := url.Parse(response.Header().Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if location.Host != "accounts.example.test" || location.Query().Get("state") != "state-1" ||
+		location.Query().Get("code_challenge") != "challenge" || location.Query().Has("prompt") {
+		t.Fatalf("location=%q", location.String())
+	}
+}
+
+func TestFeishuAuthorizeRejectsAnotherAppID(t *testing.T) {
+	service, _, _, _ := newDirectLoginTestService()
+	service.cfg.FeishuAppID = "expected-client"
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"/api/auth/providers/feishu/authorize?client_id=other-client&redirect_uri=https%3A%2F%2Fsso.example.test%2Fidps%2Fcallback&response_type=code&state=state-1",
+		nil,
+	)
+	response := httptest.NewRecorder()
+
+	service.FeishuAuthorize(response, request)
+
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "invalid_client") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestFeishuTokenConvertsFormAndBasicAuthToJSON(t *testing.T) {
+	var received map[string]string
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Header.Get("Content-Type") != "application/json; charset=utf-8" {
+			t.Fatalf("content type=%q", request.Header.Get("Content-Type"))
+		}
+		if err := json.NewDecoder(request.Body).Decode(&received); err != nil {
+			t.Fatal(err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"access_token":"token","token_type":"Bearer","expires_in":7200}`)),
+		}, nil
+	})}
+
+	service, _, _, _ := newDirectLoginTestService()
+	service.cfg.FeishuAppID = "app-id"
+	service.providerHTTP = client
+	service.feishuURLs.Token = "https://feishu.example.test/token"
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/auth/providers/feishu/token",
+		strings.NewReader("grant_type=authorization_code&code=code-1&redirect_uri=https%3A%2F%2Fsso.example.test%2Fidps%2Fcallback"),
+	)
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.SetBasicAuth("app-id", "app-secret")
+	response := httptest.NewRecorder()
+
+	service.FeishuToken(response, request)
+
+	if response.Code != http.StatusOK || received["client_id"] != "app-id" ||
+		received["client_secret"] != "app-secret" || received["code"] != "code-1" {
+		t.Fatalf("status=%d received=%#v body=%s", response.Code, received, response.Body.String())
+	}
+}
+
+func TestFeishuTokenRejectsAnotherAppIDWithoutCallingProvider(t *testing.T) {
+	called := false
+	service, _, _, _ := newDirectLoginTestService()
+	service.cfg.FeishuAppID = "expected-app"
+	service.providerHTTP = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		called = true
+		return nil, errors.New("unexpected provider call")
+	})}
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/auth/providers/feishu/token",
+		strings.NewReader("grant_type=authorization_code&code=code-1&client_id=other-app&client_secret=secret"),
+	)
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+
+	service.FeishuToken(response, request)
+
+	if response.Code != http.StatusUnauthorized || called || !strings.Contains(response.Body.String(), "invalid_client") {
+		t.Fatalf("status=%d called=%v body=%s", response.Code, called, response.Body.String())
+	}
+}
+
+func TestFeishuUserInfoFlattensProviderResponse(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Header.Get("Authorization") != "Bearer user-token" {
+			t.Fatalf("authorization=%q", request.Header.Get("Authorization"))
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(
+				`{"code":0,"msg":"success","data":{"name":"Alice","en_name":"alice","avatar_url":"https://example.test/avatar.png","open_id":"ou_123","union_id":"on_123","email":"alice@example.com","tenant_key":"tenant"}}`,
+			)),
+		}, nil
+	})}
+
+	service, _, _, _ := newDirectLoginTestService()
+	service.providerHTTP = client
+	service.feishuURLs.UserInfo = "https://feishu.example.test/userinfo"
+	request := httptest.NewRequest(http.MethodGet, "/api/auth/providers/feishu/userinfo", nil)
+	request.Header.Set("Authorization", "Bearer user-token")
+	response := httptest.NewRecorder()
+
+	service.FeishuUserInfo(response, request)
+
+	var body map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != http.StatusOK || body["sub"] != "ou_123" || body["email"] != "alice@example.com" ||
+		body["preferred_username"] != "alice" {
+		t.Fatalf("status=%d body=%#v", response.Code, body)
+	}
+}
+
 func TestFederatedCallbackRedirectsNewIdentityToWebsiteRegistration(t *testing.T) {
 	service, transactions, upstream, _ := newDirectLoginTestService()
 	service.cfg.OIDCProviderIDs = map[string]string{"github": "github-idp"}
 	transactions.transactions["state"] = transaction{State: "state", Federated: true, Provider: "github", ReturnTo: "/workspace"}
 	upstream.intentInfo = zitadel.IDPInformation{IDPID: "github-idp", UserID: "external-user", UserName: "octocat", Email: "octo@example.com", DisplayName: "Octo Cat"}
-	request := httptest.NewRequest(http.MethodGet, "/api/auth/oidc/callback?state=state&idp_intent_id=intent&idp_intent_token=token", nil)
+	request := httptest.NewRequest(http.MethodGet, "/api/auth/oidc/callback?state=state&id=intent&token=token", nil)
 	response := httptest.NewRecorder()
 
 	service.Callback(response, request)
@@ -153,6 +290,122 @@ func TestFederatedRegistrationCreatesLinkedUserAndSession(t *testing.T) {
 	}
 	if value, err := sessions.Get(context.Background(), platformCookie.Value); err != nil || value.Subject != "created-user" {
 		t.Fatalf("session=%#v err=%v", value, err)
+	}
+}
+
+func TestFederatedSessionUsesCanonicalProfileWhenProviderOmitsAttributes(t *testing.T) {
+	service, _, upstream, sessions := newDirectLoginTestService()
+	upstream.profileUser = zitadel.User{
+		ID: "linked-user", LoginName: "alice", DisplayName: "Alice", Email: "alice@example.com",
+	}
+	response := httptest.NewRecorder()
+
+	if err := service.createFederatedSession(context.Background(), response, "linked-user", zitadel.IDPInformation{}); err != nil {
+		t.Fatal(err)
+	}
+	cookies := response.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("cookies=%#v", cookies)
+	}
+	value, err := sessions.Get(context.Background(), cookies[0].Value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.Email != "alice@example.com" || value.DisplayName != "Alice" || value.PreferredUsername != "alice" {
+		t.Fatalf("session=%#v", value)
+	}
+}
+
+func TestStartFeishuIDPLinkBindsCurrentSessionAndProvider(t *testing.T) {
+	service, transactions, upstream, sessions := newDirectLoginTestService()
+	service.cfg.OIDCProviderIDs["feishu"] = "feishu-idp"
+	upstream.intentURL = "https://sso.example.test/idp/authorize"
+	now := time.Now().UTC()
+	if err := sessions.Put(context.Background(), "session-id", session.Session{
+		Subject: "current-user", CreatedAt: now, LastSeenAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"/api/auth/idp-links/start?provider=feishu&return_to=%2Faccount%2Fsecurity",
+		nil,
+	)
+	request.AddCookie(&http.Cookie{Name: "__Secure-sg_session", Value: "session-id"})
+	response := httptest.NewRecorder()
+
+	service.StartIDPLink(response, request)
+
+	if response.Code != http.StatusFound || response.Header().Get("Location") != upstream.intentURL {
+		t.Fatalf("status=%d location=%q", response.Code, response.Header().Get("Location"))
+	}
+	if upstream.intentIDPID != "feishu-idp" {
+		t.Fatalf("provider id=%q", upstream.intentIDPID)
+	}
+	if len(transactions.links) != 1 {
+		t.Fatalf("link transactions=%#v", transactions.links)
+	}
+	for _, tx := range transactions.links {
+		if tx.Subject != "current-user" || tx.Provider != "feishu" || tx.ReturnTo != "/account/security" {
+			t.Fatalf("link transaction=%#v", tx)
+		}
+		if !strings.Contains(upstream.intentSuccessURL, "/api/auth/idp-links/callback?state="+url.QueryEscape(tx.State)) ||
+			!strings.Contains(upstream.intentFailureURL, "provider=feishu") {
+			t.Fatalf("success=%q failure=%q", upstream.intentSuccessURL, upstream.intentFailureURL)
+		}
+	}
+}
+
+func TestFeishuIDPLinkCallbackAddsOpenIDToCurrentAccount(t *testing.T) {
+	service, transactions, upstream, _ := newDirectLoginTestService()
+	service.cfg.OIDCProviderIDs["feishu"] = "feishu-idp"
+	transactions.links["link-state"] = linkTransaction{
+		State: "link-state", Subject: "current-user", Provider: "feishu",
+		ReturnTo: "/account/security", CreatedAt: time.Now().UTC(),
+	}
+	upstream.intentInfo = zitadel.IDPInformation{IDPID: "feishu-idp", UserID: "ou_123"}
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"/api/auth/idp-links/callback?state=link-state&id=intent&token=token",
+		nil,
+	)
+	response := httptest.NewRecorder()
+
+	service.IDPLinkCallback(response, request)
+
+	if response.Code != http.StatusFound ||
+		response.Header().Get("Location") != "/account/security?link_status=success&provider=feishu" {
+		t.Fatalf("status=%d location=%q", response.Code, response.Header().Get("Location"))
+	}
+	if upstream.addedUserID != "current-user" || upstream.addedLink.IDPID != "feishu-idp" ||
+		upstream.addedLink.UserID != "ou_123" || upstream.addedLink.UserName != "ou_123" {
+		t.Fatalf("user=%q link=%#v", upstream.addedUserID, upstream.addedLink)
+	}
+	if _, ok := transactions.links["link-state"]; ok {
+		t.Fatal("link transaction was not consumed")
+	}
+}
+
+func TestIdentityProviderIntentCredentialsSupportsZitadelCallbackNames(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{name: "current", query: "id=intent&token=secret"},
+		{name: "legacy snake case", query: "idp_intent_id=intent&idp_intent_token=secret"},
+		{name: "legacy camel case", query: "idpIntentId=intent&idpIntentToken=secret"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			values, err := url.ParseQuery(test.query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			intentID, intentToken := identityProviderIntentCredentials(values)
+			if intentID != "intent" || intentToken != "secret" {
+				t.Fatalf("intentID=%q intentToken=%q", intentID, intentToken)
+			}
+		})
 	}
 }
 
@@ -248,6 +501,9 @@ func TestPasswordCreatesOpaquePlatformSessionWithoutOIDCCallback(t *testing.T) {
 		LoginName:   "alice@example.com",
 		DisplayName: "Alice",
 	}
+	upstream.profileUser = zitadel.User{
+		ID: "zitadel-user", LoginName: "alice@example.com", DisplayName: "Alice", Email: "alice@example.com",
+	}
 	request := httptest.NewRequest(
 		http.MethodPost,
 		"/api/auth/login/password",
@@ -290,12 +546,253 @@ func TestPasswordCreatesOpaquePlatformSessionWithoutOIDCCallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	if value.Subject != "zitadel-user" ||
+		value.Email != "alice@example.com" ||
 		value.PreferredUsername != "alice@example.com" ||
 		value.UpstreamSessionID != "zitadel-session" ||
 		value.UpstreamSessionToken != "zitadel-session-token" ||
 		len(value.AuthenticationMethods) != 1 ||
 		value.AuthenticationMethods[0] != "pwd" {
 		t.Fatalf("platform session = %#v", value)
+	}
+}
+
+func TestSendEmailCodeStartsZITADELOTPChallenge(t *testing.T) {
+	service, transactions, upstream, _ := newDirectLoginTestService()
+	transactions.attempts["transaction"] = loginAttempt{
+		CSRFToken: "csrf-token",
+		ReturnTo:  "/app/sichen",
+		CreatedAt: time.Now().UTC(),
+	}
+	upstream.emailOTPChallenge = zitadel.EmailOTPChallenge{
+		SessionID: "otp-session", SessionToken: "otp-session-token",
+	}
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/auth/login/email/code",
+		strings.NewReader(`{"transactionId":"transaction","email":"ALICE@example.com","csrfToken":"csrf-token"}`),
+	)
+	request.Header.Set("Origin", "https://shiguanglab.com")
+	request.AddCookie(&http.Cookie{Name: csrfCookieName, Value: "csrf-token"})
+	response := httptest.NewRecorder()
+
+	service.SendEmailCode(response, request)
+
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	attempt := transactions.attempts["transaction"]
+	if upstream.otpEmail != "alice@example.com" || attempt.Email != "alice@example.com" ||
+		attempt.OTPSessionID != "otp-session" || attempt.OTPSessionToken != "otp-session-token" ||
+		!attempt.OTPChallengeRequested ||
+		upstream.otpURLTemplate != "https://shiguanglab.com/api/auth/login/email/callback?transaction_id=transaction&code={{.Code}}" {
+		t.Fatalf("email=%q template=%q attempt=%#v", upstream.otpEmail, upstream.otpURLTemplate, attempt)
+	}
+}
+
+func TestVerifyEmailCodeCreatesOpaquePlatformSession(t *testing.T) {
+	service, transactions, upstream, sessions := newDirectLoginTestService()
+	transactions.attempts["transaction"] = loginAttempt{
+		CSRFToken: "csrf-token", ReturnTo: "/app/sichen", Email: "alice@example.com",
+		OTPSessionID: "otp-session", OTPSessionToken: "otp-session-token", OTPChallengeRequested: true,
+		CreatedAt: time.Now().UTC(),
+	}
+	upstream.emailOTPSession = zitadel.Session{
+		ID: "otp-session", Token: "rotated-session-token", Subject: "zitadel-user",
+		LoginName: "alice", DisplayName: "Alice",
+	}
+	upstream.profileUser = zitadel.User{
+		ID: "zitadel-user", LoginName: "alice", DisplayName: "Alice", Email: "alice@example.com",
+	}
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/auth/login/email/verify",
+		strings.NewReader(`{"transactionId":"transaction","code":"12345678","csrfToken":"csrf-token"}`),
+	)
+	request.Header.Set("Origin", "https://shiguanglab.com")
+	request.AddCookie(&http.Cookie{Name: csrfCookieName, Value: "csrf-token"})
+	response := httptest.NewRecorder()
+
+	service.VerifyEmailCode(response, request)
+
+	if response.Code != http.StatusOK || upstream.otpSessionID != "otp-session" || upstream.otpCode != "12345678" {
+		t.Fatalf("status=%d body=%s session=%q code=%q", response.Code, response.Body.String(), upstream.otpSessionID, upstream.otpCode)
+	}
+	if _, ok := transactions.attempts["transaction"]; ok {
+		t.Fatal("email OTP login transaction was not consumed")
+	}
+	var platformCookie *http.Cookie
+	for _, cookie := range response.Result().Cookies() {
+		if cookie.Name == "__Secure-sg_session" {
+			platformCookie = cookie
+		}
+	}
+	if platformCookie == nil || platformCookie.Value == "" {
+		t.Fatalf("platform cookie=%#v", platformCookie)
+	}
+	value, err := sessions.Get(context.Background(), platformCookie.Value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.Subject != "zitadel-user" || value.Email != "alice@example.com" ||
+		value.UpstreamSessionToken != "rotated-session-token" || len(value.AuthenticationMethods) != 1 ||
+		value.AuthenticationMethods[0] != "otp" {
+		t.Fatalf("platform session=%#v", value)
+	}
+}
+
+func TestEmailCodeCallbackCreatesSessionAndRedirects(t *testing.T) {
+	service, transactions, upstream, sessions := newDirectLoginTestService()
+	transactions.attempts["transaction"] = loginAttempt{
+		CSRFToken: "csrf-token", ReturnTo: "/app/sichen", Email: "alice@example.com",
+		OTPSessionID: "otp-session", OTPSessionToken: "otp-session-token", OTPChallengeRequested: true,
+		CreatedAt: time.Now().UTC(),
+	}
+	upstream.emailOTPSession = zitadel.Session{
+		ID: "otp-session", Token: "rotated-session-token", Subject: "zitadel-user",
+		LoginName: "alice", DisplayName: "Alice",
+	}
+	upstream.profileUser = zitadel.User{
+		ID: "zitadel-user", LoginName: "alice", DisplayName: "Alice", Email: "alice@example.com",
+	}
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"/api/auth/login/email/callback?transaction_id=transaction&code=12345678",
+		nil,
+	)
+	request.AddCookie(&http.Cookie{Name: csrfCookieName, Value: "csrf-token"})
+	response := httptest.NewRecorder()
+
+	service.EmailCodeCallback(response, request)
+
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/app/sichen" ||
+		upstream.otpSessionID != "otp-session" || upstream.otpCode != "12345678" {
+		t.Fatalf("status=%d location=%q session=%q code=%q", response.Code, response.Header().Get("Location"), upstream.otpSessionID, upstream.otpCode)
+	}
+	if _, ok := transactions.attempts["transaction"]; ok {
+		t.Fatal("email OTP login transaction was not consumed")
+	}
+	var platformCookie *http.Cookie
+	for _, cookie := range response.Result().Cookies() {
+		if cookie.Name == "__Secure-sg_session" {
+			platformCookie = cookie
+		}
+	}
+	if platformCookie == nil || platformCookie.Value == "" {
+		t.Fatalf("platform cookie=%#v", platformCookie)
+	}
+	if _, err := sessions.Get(context.Background(), platformCookie.Value); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEmailCodeCallbackRequiresOriginalBrowser(t *testing.T) {
+	service, transactions, upstream, _ := newDirectLoginTestService()
+	transactions.attempts["transaction"] = loginAttempt{
+		CSRFToken: "csrf-token", Email: "alice@example.com", OTPSessionID: "otp-session",
+		OTPChallengeRequested: true, CreatedAt: time.Now().UTC(),
+	}
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"/api/auth/login/email/callback?transaction_id=transaction&code=12345678",
+		nil,
+	)
+	response := httptest.NewRecorder()
+
+	service.EmailCodeCallback(response, request)
+
+	if response.Code != http.StatusSeeOther ||
+		response.Header().Get("Location") != "https://shiguanglab.com/login?mode=email&email_status=browser" {
+		t.Fatalf("status=%d location=%q", response.Code, response.Header().Get("Location"))
+	}
+	if upstream.otpCode != "" {
+		t.Fatalf("unexpected verification code=%q", upstream.otpCode)
+	}
+	if _, ok := transactions.attempts["transaction"]; !ok {
+		t.Fatal("browser mismatch consumed the login transaction")
+	}
+}
+
+func TestVerifyEmailCodeKeepsAttemptAfterInvalidCode(t *testing.T) {
+	service, transactions, upstream, _ := newDirectLoginTestService()
+	transactions.attempts["transaction"] = loginAttempt{
+		CSRFToken: "csrf-token", Email: "alice@example.com", OTPSessionID: "otp-session",
+		OTPChallengeRequested: true, CreatedAt: time.Now().UTC(),
+	}
+	upstream.emailOTPErr = &zitadel.APIError{StatusCode: http.StatusBadRequest}
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/auth/login/email/verify",
+		strings.NewReader(`{"transactionId":"transaction","code":"000000","csrfToken":"csrf-token"}`),
+	)
+	request.Header.Set("Origin", "https://shiguanglab.com")
+	request.AddCookie(&http.Cookie{Name: csrfCookieName, Value: "csrf-token"})
+	response := httptest.NewRecorder()
+
+	service.VerifyEmailCode(response, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if _, ok := transactions.attempts["transaction"]; !ok {
+		t.Fatal("invalid code consumed the login transaction")
+	}
+}
+
+func TestProfileReturnsCanonicalZITADELUser(t *testing.T) {
+	service, _, upstream, sessions := newDirectLoginTestService()
+	now := time.Now().UTC()
+	if err := sessions.Put(context.Background(), "profile-session", session.Session{
+		Subject: "zitadel-user", CreatedAt: now, LastSeenAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	upstream.profileUser = zitadel.User{
+		ID: "zitadel-user", LoginName: "alice@example.com", DisplayName: "Alice Zhang",
+		GivenName: "Alice", FamilyName: "Zhang", NickName: "Ali", PreferredLanguage: "zh-CN",
+		Gender: "GENDER_FEMALE", Email: "alice@example.com", EmailVerified: true,
+		Phone: "+8613800000000", PhoneVerified: true, State: "USER_STATE_ACTIVE",
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/account/profile", nil)
+	request.AddCookie(&http.Cookie{Name: "__Secure-sg_session", Value: "profile-session"})
+	response := httptest.NewRecorder()
+
+	service.Profile(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var body struct {
+		ID            string `json:"id"`
+		Email         string `json:"email"`
+		EmailVerified bool   `json:"emailVerified"`
+		Phone         string `json:"phone"`
+		PhoneVerified bool   `json:"phoneVerified"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.ID != "zitadel-user" || body.Email != "alice@example.com" || !body.EmailVerified ||
+		body.Phone != "+8613800000000" || !body.PhoneVerified || upstream.profileUserID != "zitadel-user" {
+		t.Fatalf("profile=%#v requestedUser=%q", body, upstream.profileUserID)
+	}
+	refreshed, err := sessions.Get(context.Background(), "profile-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.Email != "alice@example.com" || refreshed.DisplayName != "Alice Zhang" ||
+		refreshed.PreferredUsername != "alice@example.com" {
+		t.Fatalf("session summary=%#v", refreshed)
+	}
+}
+
+func TestProfileRequiresSession(t *testing.T) {
+	service, _, _, _ := newDirectLoginTestService()
+	response := httptest.NewRecorder()
+
+	service.Profile(response, httptest.NewRequest(http.MethodGet, "/api/account/profile", nil))
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 
@@ -405,6 +902,12 @@ func newDirectLoginTestService() (*Service, *fakeTransactionRepository, *fakeZit
 	}, transactions, upstream, sessions
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
 type fakeTransactionRepository struct {
 	mu           sync.Mutex
 	attempts     map[string]loginAttempt
@@ -474,6 +977,16 @@ func (f *fakeTransactionRepository) putAttempt(_ context.Context, id string, val
 	return nil
 }
 
+func (f *fakeTransactionRepository) getAttempt(_ context.Context, id string) (loginAttempt, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	value, ok := f.attempts[id]
+	if !ok {
+		return loginAttempt{}, errTransactionNotFound
+	}
+	return value, nil
+}
+
 func (f *fakeTransactionRepository) takeAttempt(_ context.Context, id string) (loginAttempt, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -483,6 +996,13 @@ func (f *fakeTransactionRepository) takeAttempt(_ context.Context, id string) (l
 	}
 	delete(f.attempts, id)
 	return value, nil
+}
+
+func (f *fakeTransactionRepository) deleteAttempt(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.attempts, id)
+	return nil
 }
 
 func (f *fakeTransactionRepository) putFederatedRegistration(_ context.Context, value federatedRegistration) error {
@@ -529,20 +1049,41 @@ func (f *fakeTransactionRepository) close() error {
 }
 
 type fakeZitadelSessionClient struct {
-	passwordSession zitadel.Session
-	err             error
-	calls           int
-	loginName       string
-	password        string
-	createdUsername string
-	createdEmail    string
-	createdPassword string
-	createdLink     zitadel.IDPLink
-	intentURL       string
-	intentInfo      zitadel.IDPInformation
-	links           []zitadel.IDPLink
-	addedUserID     string
-	addedLink       zitadel.IDPLink
+	passwordSession   zitadel.Session
+	emailOTPChallenge zitadel.EmailOTPChallenge
+	emailOTPSession   zitadel.Session
+	emailOTPErr       error
+	err               error
+	calls             int
+	loginName         string
+	password          string
+	otpEmail          string
+	otpURLTemplate    string
+	otpSessionID      string
+	otpCode           string
+	profileUser       zitadel.User
+	profileUserID     string
+	profileErr        error
+	createdUsername   string
+	createdEmail      string
+	createdPassword   string
+	createdLink       zitadel.IDPLink
+	intentURL         string
+	intentIDPID       string
+	intentSuccessURL  string
+	intentFailureURL  string
+	intentInfo        zitadel.IDPInformation
+	links             []zitadel.IDPLink
+	addedUserID       string
+	addedLink         zitadel.IDPLink
+}
+
+func (f *fakeZitadelSessionClient) GetUserByID(_ context.Context, userID string) (zitadel.User, error) {
+	f.profileUserID = userID
+	if f.profileErr != nil {
+		return zitadel.User{}, f.profileErr
+	}
+	return f.profileUser, nil
 }
 
 func (f *fakeZitadelSessionClient) ListAuthorizations(
@@ -560,6 +1101,26 @@ func (f *fakeZitadelSessionClient) PasswordSession(_ context.Context, loginName,
 		return zitadel.Session{}, f.err
 	}
 	return f.passwordSession, nil
+}
+
+func (f *fakeZitadelSessionClient) StartEmailOTP(_ context.Context, email, urlTemplate string) (zitadel.EmailOTPChallenge, error) {
+	f.calls++
+	f.otpEmail = email
+	f.otpURLTemplate = urlTemplate
+	if f.emailOTPErr != nil {
+		return zitadel.EmailOTPChallenge{}, f.emailOTPErr
+	}
+	return f.emailOTPChallenge, nil
+}
+
+func (f *fakeZitadelSessionClient) VerifyEmailOTP(_ context.Context, sessionID, code string) (zitadel.Session, error) {
+	f.calls++
+	f.otpSessionID = sessionID
+	f.otpCode = code
+	if f.emailOTPErr != nil {
+		return zitadel.Session{}, f.emailOTPErr
+	}
+	return f.emailOTPSession, nil
 }
 
 func (f *fakeZitadelSessionClient) DeleteSession(context.Context, string, string) error {
@@ -589,7 +1150,10 @@ func (f *fakeZitadelSessionClient) CreateHumanUserWithIDPLink(_ context.Context,
 	return zitadel.CreatedUser{ID: "created-user"}, nil
 }
 
-func (f *fakeZitadelSessionClient) StartIdentityProviderIntent(context.Context, string, string, string) (string, error) {
+func (f *fakeZitadelSessionClient) StartIdentityProviderIntent(_ context.Context, idpID, successURL, failureURL string) (string, error) {
+	f.intentIDPID = idpID
+	f.intentSuccessURL = successURL
+	f.intentFailureURL = failureURL
 	if f.err != nil {
 		return "", f.err
 	}
@@ -618,6 +1182,21 @@ func (f *fakeZitadelSessionClient) ListIDPLinks(context.Context, string) ([]zita
 		return nil, f.err
 	}
 	return append([]zitadel.IDPLink(nil), f.links...), nil
+}
+
+func (f *fakeZitadelSessionClient) UpdateHumanUser(_ context.Context, _ string, _ map[string]any) error {
+	if f.err != nil {
+		return f.err
+	}
+	return nil
+}
+
+func (f *fakeZitadelSessionClient) SetUserMetadata(context.Context, string, string, string) error {
+	return nil
+}
+
+func (f *fakeZitadelSessionClient) GetUserMetadata(context.Context, string, string) (string, error) {
+	return "", nil
 }
 
 var _ transactionRepository = (*fakeTransactionRepository)(nil)

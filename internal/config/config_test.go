@@ -1,10 +1,28 @@
 package config
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestDefaultAllowedReturnOriginsIncludePointsHost(t *testing.T) {
+	t.Setenv("APP_ENV", "development")
+	t.Setenv("GATEWAY_SHARED_TOKEN", strings.Repeat("g", 32))
+	t.Setenv("SESSION_BACKEND", "memory")
+	t.Setenv("SESSION_ENCRYPTION_KEY", "")
+	t.Setenv("ALLOWED_RETURN_ORIGINS", "")
+	t.Setenv("OIDC_PROVIDER_IDS", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(cfg.AllowedReturnOrigins, "https://points.shiguanglab.com") {
+		t.Fatalf("allowed return origins = %#v", cfg.AllowedReturnOrigins)
+	}
+}
 
 func TestProductionRejectsMemoryAndMissingSigningKey(t *testing.T) {
 	cfg := Config{

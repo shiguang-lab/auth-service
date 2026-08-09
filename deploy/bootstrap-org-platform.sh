@@ -105,7 +105,7 @@ case "$status" in
 esac
 
 # ── 3. Ensure the platform project roles ─────────────────────────────────────
-for role in "org:admin|Organization Admin" "org:member|Organization Member" "org:viewer|Organization Viewer" "opc:system-admin|OPC 系统管理员"; do
+for role in "org:admin|Organization Admin" "org:member|Organization Member" "org:viewer|Organization Viewer" "opc:system-admin|OPC 系统管理员" "platform:points-admin|Points Administrator" "platform:points-auditor|Points Auditor"; do
   key="${role%%|*}"; display="${role#*|}"
   jq -n --arg roleKey "$key" --arg displayName "$display" \
     '{roleKey:$roleKey,displayName:$displayName}' > "$workdir/role-request.json"
@@ -124,11 +124,12 @@ for role in "org:admin|Organization Admin" "org:member|Organization Member" "org
   esac
 done
 
-# ── 3b. Grant the platform administrator role ───────────────────────────────
-# PLATFORM_ADMIN_LOGIN_NAME (default yanxianliang) receives opc:system-admin
-# on the platform project's own organization; the role therefore reaches every
+# ── 3b. Grant the platform administrator roles ──────────────────────────────
+# PLATFORM_ADMIN_LOGIN_NAME (default yanxianliang) receives platform-level roles
+# on the platform project's own organization; the roles therefore reach every
 # assertion independent of the active business-organization context.
 PLATFORM_ADMIN_LOGIN_NAME="${PLATFORM_ADMIN_LOGIN_NAME:-yanxianliang}"
+PLATFORM_ADMIN_ROLE_KEYS="${PLATFORM_ADMIN_ROLE_KEYS:-opc:system-admin platform:points-admin}"
 jq -n --arg loginName "$PLATFORM_ADMIN_LOGIN_NAME" \
   '{queries:[{loginNameQuery:{loginName:$loginName,method:"TEXT_QUERY_METHOD_EQUALS_IGNORE_CASE"}}]}' \
   > "$workdir/admin-user-search.json"
@@ -142,22 +143,23 @@ jq -n --arg orgId "$platform_org_id" --arg projectId "$project_id" --arg userId 
 status="$(api_call POST /v2beta/authorizations/search "$admin_token" "$workdir/authz-lookup.json" "$workdir/authz-existing.json")"
 require_2xx "$status" "search platform authorizations" "$workdir/authz-existing.json"
 existing_authz_id="$(jq -r '.authorizations[0].id // empty' "$workdir/authz-existing.json")"
+admin_role_keys_json="$(printf '%s\n' $PLATFORM_ADMIN_ROLE_KEYS | jq -R . | jq -s 'unique')"
 if [ -z "$existing_authz_id" ]; then
-  jq -n --arg userId "$platform_admin_id" --arg projectId "$project_id" --arg orgId "$platform_org_id" \
-    '{userId:$userId,projectId:$projectId,organizationId:$orgId,roleKeys:["opc:system-admin"]}' \
+  jq -n --arg userId "$platform_admin_id" --arg projectId "$project_id" --arg orgId "$platform_org_id" --argjson roleKeys "$admin_role_keys_json" \
+    '{userId:$userId,projectId:$projectId,organizationId:$orgId,roleKeys:$roleKeys}' \
     > "$workdir/authz-create.json"
   status="$(api_call POST /v2beta/authorizations "$admin_token" "$workdir/authz-create.json" "$workdir/authz-created.json")"
-  require_2xx "$status" "grant opc:system-admin" "$workdir/authz-created.json"
-  echo "Granted opc:system-admin to $PLATFORM_ADMIN_LOGIN_NAME ($platform_admin_id)."
+  require_2xx "$status" "grant platform admin roles" "$workdir/authz-created.json"
+  echo "Granted platform admin roles $PLATFORM_ADMIN_ROLE_KEYS to $PLATFORM_ADMIN_LOGIN_NAME ($platform_admin_id)."
 else
-  merged_role_keys="$(jq -c '(.authorizations[0].roles // []) + ["opc:system-admin"] | unique' "$workdir/authz-existing.json")"
-  if jq -e '.authorizations[0].roles | index("opc:system-admin")' "$workdir/authz-existing.json" > /dev/null; then
-    echo "$PLATFORM_ADMIN_LOGIN_NAME already holds opc:system-admin."
+  merged_role_keys="$(jq -c --argjson desired "$admin_role_keys_json" '(.authorizations[0].roles // []) + $desired | unique' "$workdir/authz-existing.json")"
+  if [ "$(jq -c '.authorizations[0].roles | unique' "$workdir/authz-existing.json")" = "$merged_role_keys" ]; then
+    echo "$PLATFORM_ADMIN_LOGIN_NAME already holds platform admin roles $PLATFORM_ADMIN_ROLE_KEYS."
   else
     jq -n --argjson roleKeys "$merged_role_keys" '{roleKeys:$roleKeys}' > "$workdir/authz-update.json"
     status="$(api_call PATCH "/v2beta/authorizations/$existing_authz_id" "$admin_token" "$workdir/authz-update.json" "$workdir/authz-updated.json")"
-    require_2xx "$status" "merge opc:system-admin into authorization" "$workdir/authz-updated.json"
-    echo "Merged opc:system-admin into the existing platform authorization."
+    require_2xx "$status" "merge platform admin roles into authorization" "$workdir/authz-updated.json"
+    echo "Merged platform admin roles into the existing platform authorization."
   fi
 fi
 

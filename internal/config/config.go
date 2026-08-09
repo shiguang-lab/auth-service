@@ -89,7 +89,7 @@ func Load() (Config, error) {
 		OIDCClientSecret:           strings.TrimSpace(os.Getenv("OIDC_CLIENT_SECRET")),
 		OIDCRedirectURL:            envOr("OIDC_REDIRECT_URL", "https://shiguanglab.com/api/auth/oidc/callback"),
 		OIDCProviderIDs:            providerIDs,
-		AllowedReturnOrigins:       splitCSV(envOr("ALLOWED_RETURN_ORIGINS", "https://shiguanglab.com,https://www.shiguanglab.com,https://opc.shiguanglab.com,https://huiguang.shiguanglab.com")),
+		AllowedReturnOrigins:       splitCSV(envOr("ALLOWED_RETURN_ORIGINS", "https://shiguanglab.com,https://www.shiguanglab.com,https://opc.shiguanglab.com,https://huiguang.shiguanglab.com,https://points.shiguanglab.com")),
 		DefaultEntitlements:        splitCSV(envOr("DEFAULT_ENTITLEMENTS", "superagents:access,huiguang:access,platform:access")),
 		IdentityIssuer:             envOr("IDENTITY_ISSUER", "https://auth.shiguanglab.com"),
 		SigningKeyFile:             strings.TrimSpace(os.Getenv("IDENTITY_SIGNING_KEY_FILE")),

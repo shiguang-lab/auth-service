@@ -105,7 +105,14 @@ case "$status" in
 esac
 
 # ── 3. Ensure the platform project roles ─────────────────────────────────────
-for role in "org:admin|Organization Admin" "org:member|Organization Member" "org:viewer|Organization Viewer" "opc:system-admin|OPC 系统管理员" "platform:points-admin|Points Administrator" "platform:points-auditor|Points Auditor"; do
+for role in \
+  "org:admin|Organization Admin" \
+  "org:member|Organization Member" \
+  "org:viewer|Organization Viewer" \
+  "opc:system-admin|OPC 系统管理员" \
+  "platform:points-admin|Points Administrator" \
+  "platform:points-auditor|Points Auditor" \
+  "platform:points-integration-admin|Points Integration Administrator"; do
   key="${role%%|*}"; display="${role#*|}"
   jq -n --arg roleKey "$key" --arg displayName "$display" \
     '{roleKey:$roleKey,displayName:$displayName}' > "$workdir/role-request.json"

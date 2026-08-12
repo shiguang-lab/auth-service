@@ -153,9 +153,10 @@ NAS 内网(推荐,免公网回环)`http://auth-service:8081/.well-known/jwks.jso
 - `org:admin / org:member / org:viewer` —— 组织内角色,仅组织上下文出现;
 - `opc:system-admin`(OPC 系统管理员)等**平台角色**:与上下文无关,
   个人/组织断言中都存在;用于平台级资源(如内置 Agent 管理)的门禁;
-- `platform:points-admin / platform:points-auditor /
-  platform:points-integration-admin`分别对应积分平台管理、只读审计和接入方应用管理;
-  接入方管理员还必须通过 Points Service 的 application membership 校验;
+- `platform:points-admin / platform:points-auditor`分别对应积分平台管理和全局只读审计;
+  接入方管理员不是 IAM 全局角色,其唯一授权依据是 Points Service 中基于断言
+  `(issuer, sub)` 的 ACTIVE application membership。Auth Service 只提供可信身份,
+  不签发或推导应用成员关系;
 - 建议映射:个人上下文 = 本人全权;组织上下文按 org:* 收敛产品内角色。
 
 **租户建议**:用二元组做数据隔离键——
@@ -211,6 +212,22 @@ GET  /v1/identity/orgs/{orgId}/members     Authorization: Bearer <IDENTITY_API_T
 
 用法约束:结果做短 TTL 缓存;解析不到的 `sub` 显示「已注销用户」;
 **不要**把 displayName 写进业务表(PIPL 删除义务要求 PII 集中在 IAM 单点)。
+
+积分系统的选人器使用独立的 `POINTS_IDENTITY_SERVICE_TOKEN`，只允许
+Points BFF/服务端 secret store 持有，Points Web 和浏览器不得持有或直连：
+
+```text
+POST /v1/identity/users/search             Authorization: Bearer <POINTS_IDENTITY_SERVICE_TOKEN>
+  body: {"query":"alice","limit":10}       # query trim 后 3..64 字符，limit 1..10
+  -> {"users":[{id,loginName,displayName,state}]}  # 仅 ACTIVE，无 email
+
+POST /v1/identity/users/resolve            Authorization: Bearer <POINTS_IDENTITY_SERVICE_TOKEN>
+  body: {"userId":"<exact-zitadel-sub>"}
+  -> {"user":{id,loginName,displayName,state}}     # 仅精确 ACTIVE；否则 404
+```
+
+新增成员必须先 search 供用户选择，再由 Points 服务端在落库前 resolve
+精确复核。目录不可用返回 503 并停止写入；不得用模糊搜索结果直接创建成员。
 
 ---
 

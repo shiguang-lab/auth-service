@@ -26,7 +26,8 @@ the shared browser cookie or ZITADEL tokens.
 
 ## Implemented
 
-- Gateway-protected `GET /v1/forward-auth`
+- Canonical Access Gateway decision API: `POST /v1/authorize`
+- Compatibility forward-auth adapter: `GET /v1/forward-auth`
 - Missing and duplicate shared-cookie rejection
 - Memory session store for tests and development
 - AES-256-GCM encrypted Redis sessions and login transactions
@@ -36,6 +37,10 @@ the shared browser cookie or ZITADEL tokens.
 - ZITADEL IDP Intent callbacks for GitHub/Google; existing links sign in directly and new identities continue in Website's custom registration page
 - Parent-domain opaque session creation, inspection, and logout
 - Origin validation, CSRF protection, and Redis login rate limiting
+- Points-only, server-side user search and exact ACTIVE-user resolution with a
+  credential independent from browser, gateway, and general identity tokens
+- 60-second platform-role freshness with process-local concurrent refresh
+  suppression and privilege-clearing failure behavior
 
 Back-channel logout and automated signing-key rotation remain operational
 follow-ups. Explicit logout revokes both platform and ZITADEL sessions.
@@ -69,7 +74,8 @@ IDs in `deploy/oidc-providers.env` and the corresponding provider registrations.
 | `GET` | `/health/live` | Public |
 | `GET` | `/health/ready` | Public |
 | `GET` | `/.well-known/jwks.json` | Public |
-| `GET` | `/v1/forward-auth` | `X-SG-Gateway-Token` |
+| `POST` | `/v1/authorize` | `X-SG-Gateway-Token`; strict JSON decision protocol |
+| `GET` | `/v1/forward-auth` | `X-SG-Gateway-Token`; compatibility adapter only |
 | `GET` | `/api/auth/federated/start` | Gateway token; federated login only |
 | `GET` | `/api/auth/register/provider` | Gateway token; starts Website-owned federated registration |
 | `POST` | `/api/auth/login/context` | Gateway token + Origin |
@@ -79,10 +85,25 @@ IDs in `deploy/oidc-providers.env` and the corresponding provider registrations.
 | `POST` | `/api/auth/register/federated` | Gateway token + Origin + CSRF |
 | `GET` | `/api/auth/session` | Gateway token + session cookie |
 | `POST` | `/api/auth/logout` | Gateway token + Origin |
+| `POST` | `/v1/identity/users/search` | `POINTS_IDENTITY_SERVICE_TOKEN`; server-side only |
+| `POST` | `/v1/identity/users/resolve` | `POINTS_IDENTITY_SERVICE_TOKEN`; server-side only |
 
-The forward-auth endpoint consumes the standard `X-Forwarded-Method`,
+`POST /v1/authorize` is the canonical internal protocol for Access Gateway.
+It accepts a bounded JSON `authorize.Request` with unknown fields rejected and
+returns an `authorize.Response` for allow, deny, and login-redirect decisions.
+The shared credential is accepted only in `X-SG-Gateway-Token`; bearer auth is
+not part of this protocol.
+
+The compatibility forward-auth endpoint consumes the standard `X-Forwarded-Method`,
 `X-Forwarded-Uri`, `X-Forwarded-Host`, and `X-Forwarded-Proto` headers plus
 gateway-owned product policy headers. On success it returns `X-SG-Identity`.
+
+Points user selection is a two-step server-side contract. `search` accepts a
+trimmed 3-64 character query and limit 1-10, and returns only ACTIVE users as
+`{id, loginName, displayName, state}`. Before persisting a membership, the
+Points backend calls `resolve` with `{userId}` to repeat an exact ACTIVE check.
+The dedicated credential must remain in the Points server secret store and is
+never sent to Points Web or a browser.
 
 See [docs/architecture.md](docs/architecture.md) for trust boundaries and the
 request flow, and [docs/integration.md](docs/integration.md) for the product

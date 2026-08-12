@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -16,11 +18,13 @@ import (
 	"github.com/shiguanglab/auth-service/internal/identity"
 	loginservice "github.com/shiguanglab/auth-service/internal/login"
 	orgservice "github.com/shiguanglab/auth-service/internal/orgs"
+	"github.com/shiguanglab/auth-service/internal/platformroleadmin"
 )
 
 const (
-	gatewayTokenHeader = "X-SG-Gateway-Token"
-	identityHeader     = "X-SG-Identity"
+	gatewayTokenHeader       = "X-SG-Gateway-Token"
+	identityHeader           = "X-SG-Identity"
+	maxAuthorizeRequestBytes = 64 << 10
 )
 
 type ReadinessCheck func(context.Context) error
@@ -33,6 +37,14 @@ type Server struct {
 	logger       *slog.Logger
 	login        *loginservice.Service
 	orgs         *orgservice.Service
+	roleAdmin    *platformroleadmin.Service
+}
+
+// WithPlatformRoleAdmin mounts the narrowly-scoped Points IAM role API. The
+// service itself remains fail-closed when no production writer is configured.
+func (s *Server) WithPlatformRoleAdmin(service *platformroleadmin.Service) *Server {
+	s.roleAdmin = service
+	return s
 }
 
 // WithOrganizations attaches the organization domain service. Routes are only
@@ -77,6 +89,7 @@ func (s *Server) Handler() http.Handler {
 	router.Get("/health/ready", s.handleReady)
 	router.Get("/.well-known/jwks.json", s.handleJWKS)
 	router.With(s.authenticateGateway).Get("/v1/forward-auth", s.handleForwardAuth)
+	router.With(s.authenticateGateway).Post("/v1/authorize", s.handleAuthorize)
 	if s.login != nil {
 		router.Group(func(auth chi.Router) {
 			auth.Use(s.authenticateGateway)
@@ -94,6 +107,11 @@ func (s *Server) Handler() http.Handler {
 			auth.Get("/api/auth/idp-links", s.login.ListIDPLinks)
 			auth.Get("/api/auth/session", s.login.Session)
 			auth.Post("/api/auth/logout", s.login.Logout)
+			if s.roleAdmin != nil {
+				auth.Post("/api/auth/iam/points-role-assignments/search", s.roleAdmin.SearchHandler)
+				auth.Post("/api/auth/iam/points-role-assignments/resolve", s.roleAdmin.ResolveHandler)
+				auth.Put("/api/auth/iam/points-role-assignments/{userID}", s.roleAdmin.UpdateHandler)
+			}
 			if s.orgs != nil {
 				auth.Post("/api/auth/context", s.orgs.SwitchContextHandler)
 				auth.Post("/api/account/orgs", s.orgs.CreateOrganizationHandler)
@@ -106,6 +124,11 @@ func (s *Server) Handler() http.Handler {
 		})
 	}
 	if s.orgs != nil {
+		router.Group(func(pointsIdentity chi.Router) {
+			pointsIdentity.Use(s.orgs.RequirePointsIdentityServiceToken)
+			pointsIdentity.Post("/v1/identity/users/search", s.orgs.SearchUsersHandler)
+			pointsIdentity.Post("/v1/identity/users/resolve", s.orgs.ResolveUserHandler)
+		})
 		router.Group(func(identityAPI chi.Router) {
 			identityAPI.Use(s.orgs.RequireIdentityAPIToken)
 			identityAPI.Post("/v1/identity/users/batch-get", s.orgs.BatchGetUsersHandler)
@@ -131,7 +154,44 @@ func (s *Server) handleForwardAuth(response http.ResponseWriter, request *http.R
 		Audience:             request.Header.Get("X-SG-Audience"),
 		RequiredEntitlements: splitCSV(request.Header.Get("X-SG-Required-Entitlements")),
 	}
-	decision := s.decision.Decide(request.Context(), input)
+	decision := s.decide(request.Context(), input)
+
+	for _, cookie := range decision.SetCookies {
+		response.Header().Add("Set-Cookie", cookie)
+	}
+	if decision.Location != "" {
+		response.Header().Set("Location", decision.Location)
+	}
+	if decision.Allow {
+		response.Header().Set(identityHeader, decision.IdentityToken)
+		response.WriteHeader(http.StatusOK)
+		return
+	}
+	writeJSON(response, decision.Status, map[string]string{"error": decision.Reason})
+}
+
+func (s *Server) handleAuthorize(response http.ResponseWriter, request *http.Request) {
+	request.Body = http.MaxBytesReader(response, request.Body, maxAuthorizeRequestBytes)
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+
+	var input authorize.Request
+	if err := decoder.Decode(&input); err != nil {
+		s.writeInvalidAuthorizeRequest(response, err)
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		s.writeInvalidAuthorizeRequest(response, err)
+		return
+	}
+	if input.RequestID == "" {
+		input.RequestID = middleware.GetReqID(request.Context())
+	}
+	writeJSON(response, http.StatusOK, s.decide(request.Context(), input))
+}
+
+func (s *Server) decide(ctx context.Context, input authorize.Request) authorize.Response {
+	decision := s.decision.Decide(ctx, input)
 	if !decision.Allow &&
 		decision.Status == http.StatusUnauthorized &&
 		(input.Method == http.MethodGet || input.Method == http.MethodHead) &&
@@ -156,19 +216,20 @@ func (s *Server) handleForwardAuth(response http.ResponseWriter, request *http.R
 		"status", decision.Status,
 		"reason", decision.Reason,
 	)
+	return decision
+}
 
-	for _, cookie := range decision.SetCookies {
-		response.Header().Add("Set-Cookie", cookie)
+func (s *Server) writeInvalidAuthorizeRequest(response http.ResponseWriter, err error) {
+	status := http.StatusBadRequest
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		status = http.StatusRequestEntityTooLarge
 	}
-	if decision.Location != "" {
-		response.Header().Set("Location", decision.Location)
-	}
-	if decision.Allow {
-		response.Header().Set(identityHeader, decision.IdentityToken)
-		response.WriteHeader(http.StatusOK)
-		return
-	}
-	writeJSON(response, decision.Status, map[string]string{"error": decision.Reason})
+	writeJSON(response, status, authorize.Response{
+		Allow:  false,
+		Status: status,
+		Reason: "invalid_request",
+	})
 }
 
 func (s *Server) handleReady(response http.ResponseWriter, request *http.Request) {

@@ -18,6 +18,8 @@ import (
 	"github.com/shiguanglab/auth-service/internal/identity"
 	loginservice "github.com/shiguanglab/auth-service/internal/login"
 	orgservice "github.com/shiguanglab/auth-service/internal/orgs"
+	"github.com/shiguanglab/auth-service/internal/platformroleadmin"
+	"github.com/shiguanglab/auth-service/internal/platformroles"
 	"github.com/shiguanglab/auth-service/internal/session"
 	"github.com/shiguanglab/auth-service/internal/zitadel"
 )
@@ -49,6 +51,19 @@ func main() {
 			logger.Error("close session store", "error", err)
 		}
 	}()
+	var roleCommandJournal *platformroleadmin.RedisCommandJournal
+	if cfg.SessionBackend == "redis" {
+		roleCommandJournal, err = platformroleadmin.NewRedisCommandJournal(redisOptions, cfg.IAMRoleCommandPrefix, cfg.SessionEncryptionKey)
+		if err != nil {
+			logger.Error("initialize IAM role command journal", "error", err)
+			os.Exit(1)
+		}
+		defer func() {
+			if err := roleCommandJournal.Close(); err != nil {
+				logger.Error("close IAM role command journal", "error", err)
+			}
+		}()
+	}
 	startupContext, cancelStartup := context.WithTimeout(context.Background(), 20*time.Second)
 	login, err := loginservice.NewService(startupContext, cfg, store, redisOptions, logger)
 	cancelStartup()
@@ -63,15 +78,9 @@ func main() {
 	}()
 
 	decision := authorize.NewService(store, signer, cfg.SessionCookieName, cfg.IdleTTL, cfg.AbsoluteTTL)
-	readiness := func(ctx context.Context) error {
-		if err := store.Ping(ctx); err != nil {
-			return err
-		}
-		return login.Ping(ctx)
-	}
-	api := httpapi.NewServer(decision, signer, cfg.GatewayToken, readiness, logger, login)
+	var directory *zitadel.Client
 	if login != nil && cfg.ZitadelProjectID != "" {
-		directory, err := zitadel.NewClient(
+		directory, err = zitadel.NewClient(
 			cfg.ZitadelInternalURL,
 			cfg.ZitadelIssuer,
 			cfg.ZitadelPATFile,
@@ -79,9 +88,32 @@ func main() {
 			cfg.ZitadelOrganizationID,
 		)
 		if err != nil {
-			logger.Error("initialize organization directory client", "error", err)
+			logger.Error("initialize platform directory client", "error", err)
 			os.Exit(1)
 		}
+		roleRefresher := platformroles.New(store, directory, cfg.ZitadelOrganizationID, cfg.ZitadelProjectID, logger)
+		login.WithPlatformRoleRefresher(roleRefresher)
+		decision.WithPlatformRoleRefresher(roleRefresher)
+	}
+	readiness := func(ctx context.Context) error {
+		if err := store.Ping(ctx); err != nil {
+			return err
+		}
+		if err := login.Ping(ctx); err != nil {
+			return err
+		}
+		if roleCommandJournal != nil {
+			return roleCommandJournal.Ping(ctx)
+		}
+		return nil
+	}
+	api := httpapi.NewServer(decision, signer, cfg.GatewayToken, readiness, logger, login)
+	if login != nil {
+		// The Redis command journal is ready when configured, but the executor
+		// remains nil until a ZITADEL writer and permanent audit sink are approved.
+		api.WithPlatformRoleAdmin(platformroleadmin.NewService(login, nil, nil, nil, cfg.IAMRoleAdminOrigins, logger))
+	}
+	if directory != nil {
 		api.WithOrganizations(orgservice.NewService(cfg, store, login, directory, logger))
 	}
 	server := &http.Server{

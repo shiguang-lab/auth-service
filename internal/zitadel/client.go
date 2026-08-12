@@ -511,6 +511,41 @@ func (c *Client) SearchUsersByIDs(ctx context.Context, ids []string) ([]User, er
 	return users, nil
 }
 
+// SearchUsers performs two bounded, non-PII directory searches so callers can
+// find users by login or display name without gaining access to email fields.
+func (c *Client) SearchUsers(ctx context.Context, query string, limit int) ([]User, error) {
+	methods := []string{"loginNameQuery", "displayNameQuery"}
+	users := make([]User, 0, limit)
+	seen := make(map[string]struct{}, limit)
+	for _, queryType := range methods {
+		queryValue := map[string]any{"method": "TEXT_QUERY_METHOD_CONTAINS_IGNORE_CASE"}
+		if queryType == "loginNameQuery" {
+			queryValue["loginName"] = query
+		} else {
+			queryValue["displayName"] = query
+		}
+		body := map[string]any{
+			"pagination": map[string]any{"limit": limit},
+			"queries":    []map[string]any{{queryType: queryValue}},
+		}
+		found, err := c.searchUsers(ctx, body)
+		if err != nil {
+			return nil, err
+		}
+		for _, user := range found {
+			if _, exists := seen[user.ID]; exists {
+				continue
+			}
+			seen[user.ID] = struct{}{}
+			users = append(users, user)
+			if len(users) == limit {
+				return users, nil
+			}
+		}
+	}
+	return users, nil
+}
+
 func (c *Client) searchUsers(ctx context.Context, body map[string]any) ([]User, error) {
 	var found struct {
 		Result []struct {

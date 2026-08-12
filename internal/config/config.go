@@ -31,11 +31,15 @@ type Config struct {
 	ZitadelOrganizationID      string
 	ZitadelProjectID           string
 	IdentityAPIToken           string
+	PointsIdentityServiceToken string
 	OIDCClientID               string
 	OIDCClientSecret           string
 	OIDCRedirectURL            string
 	OIDCProviderIDs            map[string]string
 	AllowedReturnOrigins       []string
+	IAMRoleAdminOrigins        []string
+	IAMRoleCommandPrefix       string
+	IAMRoleCommandTTL          time.Duration
 	DefaultEntitlements        []string
 	IdentityIssuer             string
 	SigningKeyFile             string
@@ -55,6 +59,10 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	absoluteTTL, err := durationOr("SESSION_ABSOLUTE_TTL", 7*24*time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
+	iamRoleCommandTTL, err := durationOr("IAM_ROLE_COMMAND_TTL", 30*24*time.Hour)
 	if err != nil {
 		return Config{}, err
 	}
@@ -85,11 +93,15 @@ func Load() (Config, error) {
 		ZitadelOrganizationID:      strings.TrimSpace(os.Getenv("ZITADEL_ORGANIZATION_ID")),
 		ZitadelProjectID:           strings.TrimSpace(os.Getenv("ZITADEL_PROJECT_ID")),
 		IdentityAPIToken:           strings.TrimSpace(os.Getenv("IDENTITY_API_TOKEN")),
+		PointsIdentityServiceToken: strings.TrimSpace(os.Getenv("POINTS_IDENTITY_SERVICE_TOKEN")),
 		OIDCClientID:               strings.TrimSpace(os.Getenv("OIDC_CLIENT_ID")),
 		OIDCClientSecret:           strings.TrimSpace(os.Getenv("OIDC_CLIENT_SECRET")),
 		OIDCRedirectURL:            envOr("OIDC_REDIRECT_URL", "https://shiguanglab.com/api/auth/oidc/callback"),
 		OIDCProviderIDs:            providerIDs,
 		AllowedReturnOrigins:       splitCSV(envOr("ALLOWED_RETURN_ORIGINS", "https://shiguanglab.com,https://www.shiguanglab.com,https://opc.shiguanglab.com,https://huiguang.shiguanglab.com,https://points.shiguanglab.com")),
+		IAMRoleAdminOrigins:        splitCSV(envOr("IAM_ROLE_ADMIN_ORIGINS", "https://points.shiguanglab.com")),
+		IAMRoleCommandPrefix:       envOr("IAM_ROLE_COMMAND_PREFIX", "auth:iam-role-command:"),
+		IAMRoleCommandTTL:          iamRoleCommandTTL,
 		DefaultEntitlements:        splitCSV(envOr("DEFAULT_ENTITLEMENTS", "superagents:access,huiguang:access,platform:access")),
 		IdentityIssuer:             envOr("IDENTITY_ISSUER", "https://auth.shiguanglab.com"),
 		SigningKeyFile:             strings.TrimSpace(os.Getenv("IDENTITY_SIGNING_KEY_FILE")),
@@ -149,16 +161,37 @@ func (c Config) Validate() error {
 		if len(c.IdentityAPIToken) < 32 {
 			return errors.New("IDENTITY_API_TOKEN must contain at least 32 characters in production")
 		}
+		if len(c.PointsIdentityServiceToken) < 32 {
+			return errors.New("POINTS_IDENTITY_SERVICE_TOKEN must contain at least 32 characters in production")
+		}
 	}
 	for _, origin := range c.AllowedReturnOrigins {
-		parsed, err := url.Parse(origin)
-		validScheme := err == nil && (parsed.Scheme == "https" || (c.Environment != "production" && parsed.Scheme == "http"))
-		if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" ||
-			(parsed.Path != "" && parsed.Path != "/") || !validScheme {
+		if !validOrigin(origin, c.Environment) {
 			return fmt.Errorf("invalid allowed return origin %q", origin)
 		}
 	}
+	if len(c.IAMRoleAdminOrigins) == 0 {
+		return errors.New("IAM_ROLE_ADMIN_ORIGINS must contain at least one origin")
+	}
+	for _, origin := range c.IAMRoleAdminOrigins {
+		if !validOrigin(origin, c.Environment) {
+			return fmt.Errorf("invalid IAM role admin origin %q", origin)
+		}
+	}
+	if c.IAMRoleCommandTTL != 0 && (c.IAMRoleCommandTTL < 24*time.Hour || c.IAMRoleCommandTTL > 90*24*time.Hour) {
+		return errors.New("IAM_ROLE_COMMAND_TTL must be between 24h and 2160h")
+	}
+	if c.IAMRoleCommandPrefix != "" && !strings.HasSuffix(c.IAMRoleCommandPrefix, ":") {
+		return errors.New("IAM_ROLE_COMMAND_PREFIX must end with a colon")
+	}
 	return nil
+}
+
+func validOrigin(origin, environment string) bool {
+	parsed, err := url.Parse(origin)
+	validScheme := err == nil && (parsed.Scheme == "https" || (environment != "production" && parsed.Scheme == "http"))
+	return err == nil && parsed.Host != "" && parsed.User == nil && parsed.RawQuery == "" && parsed.Fragment == "" &&
+		(parsed.Path == "" || parsed.Path == "/") && validScheme
 }
 
 func decodeKey(value string) ([]byte, error) {

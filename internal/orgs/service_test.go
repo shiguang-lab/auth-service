@@ -3,6 +3,7 @@ package orgs
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -28,6 +29,7 @@ type fakeDirectory struct {
 	roleCreates    int
 	grantCreates   int
 	nextID         int
+	searchErr      error
 }
 
 func newFakeDirectory() *fakeDirectory {
@@ -124,10 +126,31 @@ func (f *fakeDirectory) GetUserByLoginName(_ context.Context, loginName string) 
 }
 
 func (f *fakeDirectory) SearchUsersByIDs(_ context.Context, ids []string) ([]zitadel.User, error) {
+	if f.searchErr != nil {
+		return nil, f.searchErr
+	}
 	var result []zitadel.User
 	for _, id := range ids {
 		if user, ok := f.users[id]; ok {
 			result = append(result, user)
+		}
+	}
+	return result, nil
+}
+
+func (f *fakeDirectory) SearchUsers(_ context.Context, query string, limit int) ([]zitadel.User, error) {
+	if f.searchErr != nil {
+		return nil, f.searchErr
+	}
+	var result []zitadel.User
+	query = strings.ToLower(query)
+	for _, user := range f.users {
+		if !strings.Contains(strings.ToLower(user.LoginName), query) && !strings.Contains(strings.ToLower(user.DisplayName), query) {
+			continue
+		}
+		result = append(result, user)
+		if len(result) == limit {
+			break
 		}
 	}
 	return result, nil
@@ -154,11 +177,12 @@ func newTestService(t *testing.T) (*Service, *fakeDirectory, session.Store) {
 	directory := newFakeDirectory()
 	store := session.NewMemoryStore()
 	cfg := config.Config{
-		PublicOrigin:          testOrigin,
-		AllowedReturnOrigins:  []string{"https://opc.shiguanglab.com"},
-		ZitadelProjectID:      testProject,
-		ZitadelOrganizationID: "platform-org",
-		IdentityAPIToken:      strings.Repeat("i", 40),
+		PublicOrigin:               testOrigin,
+		AllowedReturnOrigins:       []string{"https://opc.shiguanglab.com"},
+		ZitadelProjectID:           testProject,
+		ZitadelOrganizationID:      "platform-org",
+		IdentityAPIToken:           strings.Repeat("i", 40),
+		PointsIdentityServiceToken: strings.Repeat("p", 40),
 	}
 	service := NewService(cfg, store, staticResolver{store}, directory, nil)
 	return service, directory, store
@@ -193,6 +217,11 @@ func routerFor(service *Service) http.Handler {
 		identityAPI.Use(service.RequireIdentityAPIToken)
 		identityAPI.Post("/v1/identity/users/batch-get", service.BatchGetUsersHandler)
 		identityAPI.Get("/v1/identity/orgs/{orgID}/members", service.ServiceListMembersHandler)
+	})
+	router.Group(func(pointsIdentity chi.Router) {
+		pointsIdentity.Use(service.RequirePointsIdentityServiceToken)
+		pointsIdentity.Post("/v1/identity/users/search", service.SearchUsersHandler)
+		pointsIdentity.Post("/v1/identity/users/resolve", service.ResolveUserHandler)
 	})
 	return router
 }
@@ -252,7 +281,7 @@ func TestSwitchContextRequiresMembership(t *testing.T) {
 	service, directory, store := newTestService(t)
 	aliceSession := seedSession(t, store, "alice")
 	bobSession := seedSession(t, store, "bob")
-	directory.users["bob"] = zitadel.User{ID: "bob", LoginName: "bob@shiguang", DisplayName: "Bob"}
+	directory.users["bob"] = zitadel.User{ID: "bob", LoginName: "bob@shiguang", DisplayName: "Bob", State: "USER_STATE_ACTIVE"}
 	handler := routerFor(service)
 
 	created := doJSON(t, handler, http.MethodPost, "/api/account/orgs", aliceSession, `{"name":"org-a"}`, nil)
@@ -288,7 +317,7 @@ func TestSwitchContextRequiresMembership(t *testing.T) {
 func TestMemberManagementLifecycle(t *testing.T) {
 	service, directory, store := newTestService(t)
 	aliceSession := seedSession(t, store, "alice")
-	directory.users["bob"] = zitadel.User{ID: "bob", LoginName: "bob@shiguang", DisplayName: "Bob"}
+	directory.users["bob"] = zitadel.User{ID: "bob", LoginName: "bob@shiguang", DisplayName: "Bob", State: "USER_STATE_ACTIVE"}
 	handler := routerFor(service)
 
 	created := doJSON(t, handler, http.MethodPost, "/api/account/orgs", aliceSession, `{"name":"org-a"}`, nil)
@@ -372,6 +401,106 @@ func TestIdentityFacadeRequiresToken(t *testing.T) {
 	})
 	if allowed.Code != http.StatusOK || !strings.Contains(allowed.Body.String(), "U One") {
 		t.Fatalf("batch get users: %d %s", allowed.Code, allowed.Body.String())
+	}
+}
+
+func TestPointsIdentitySearchIsMinimalActiveOnlyAndFailClosed(t *testing.T) {
+	service, directory, _ := newTestService(t)
+	directory.users["active"] = zitadel.User{
+		ID: "active", LoginName: "alice@shiguang", DisplayName: "Alice", Email: "alice@example.com", State: "USER_STATE_ACTIVE",
+	}
+	directory.users["disabled"] = zitadel.User{
+		ID: "disabled", LoginName: "alice-disabled@shiguang", DisplayName: "Alice Disabled", Email: "disabled@example.com", State: "USER_STATE_INACTIVE",
+	}
+	handler := routerFor(service)
+
+	wrongToken := doJSON(t, handler, http.MethodPost, "/v1/identity/users/search", "", `{"query":"alice","limit":10}`, map[string]string{
+		"Authorization": "Bearer " + strings.Repeat("i", 40),
+	})
+	if wrongToken.Code != http.StatusUnauthorized {
+		t.Fatalf("general identity token must not authorize Points search: %d", wrongToken.Code)
+	}
+
+	for name, body := range map[string]string{
+		"short query":   `{"query":"al","limit":10}`,
+		"zero limit":    `{"query":"alice","limit":0}`,
+		"large limit":   `{"query":"alice","limit":11}`,
+		"unknown field": `{"query":"alice","limit":10,"email":true}`,
+		"trailing json": `{"query":"alice","limit":10} {}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := doJSON(t, handler, http.MethodPost, "/v1/identity/users/search", "", body, map[string]string{
+				"Authorization": "Bearer " + strings.Repeat("p", 40),
+			})
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+
+	allowed := doJSON(t, handler, http.MethodPost, "/v1/identity/users/search", "", `{"query":"alice","limit":10}`, map[string]string{
+		"Authorization": "Bearer " + strings.Repeat("p", 40),
+	})
+	if allowed.Code != http.StatusOK || !strings.Contains(allowed.Body.String(), `"id":"active"`) {
+		t.Fatalf("search active users: %d %s", allowed.Code, allowed.Body.String())
+	}
+	if strings.Contains(allowed.Body.String(), "disabled") || strings.Contains(allowed.Body.String(), "example.com") || strings.Contains(allowed.Body.String(), "email") {
+		t.Fatalf("search leaked inactive user or unnecessary PII: %s", allowed.Body.String())
+	}
+
+	directory.searchErr = errors.New("directory unavailable")
+	failed := doJSON(t, handler, http.MethodPost, "/v1/identity/users/search", "", `{"query":"alice","limit":10}`, map[string]string{
+		"Authorization": "Bearer " + strings.Repeat("p", 40),
+	})
+	if failed.Code != http.StatusServiceUnavailable {
+		t.Fatalf("directory failure must fail closed: %d %s", failed.Code, failed.Body.String())
+	}
+}
+
+func TestPointsIdentityResolveRequiresDedicatedTokenAndActiveExactID(t *testing.T) {
+	service, directory, _ := newTestService(t)
+	directory.users["active"] = zitadel.User{
+		ID: "active", LoginName: "alice@shiguang", DisplayName: "Alice", Email: "alice@example.com", State: "USER_STATE_ACTIVE",
+	}
+	directory.users["disabled"] = zitadel.User{
+		ID: "disabled", LoginName: "disabled@shiguang", DisplayName: "Disabled", Email: "disabled@example.com", State: "USER_STATE_INACTIVE",
+	}
+	handler := routerFor(service)
+
+	wrongToken := doJSON(t, handler, http.MethodPost, "/v1/identity/users/resolve", "", `{"userId":"active"}`, map[string]string{
+		"Authorization": "Bearer " + strings.Repeat("i", 40),
+	})
+	if wrongToken.Code != http.StatusUnauthorized {
+		t.Fatalf("general identity token must not authorize Points resolve: %d", wrongToken.Code)
+	}
+
+	active := doJSON(t, handler, http.MethodPost, "/v1/identity/users/resolve", "", `{"userId":"active"}`, map[string]string{
+		"Authorization": "Bearer " + strings.Repeat("p", 40),
+	})
+	if active.Code != http.StatusOK || !strings.Contains(active.Body.String(), `"id":"active"`) {
+		t.Fatalf("resolve active user: %d %s", active.Code, active.Body.String())
+	}
+	if strings.Contains(active.Body.String(), "example.com") || strings.Contains(active.Body.String(), "email") {
+		t.Fatalf("resolve leaked unnecessary PII: %s", active.Body.String())
+	}
+
+	disabled := doJSON(t, handler, http.MethodPost, "/v1/identity/users/resolve", "", `{"userId":"disabled"}`, map[string]string{
+		"Authorization": "Bearer " + strings.Repeat("p", 40),
+	})
+	if disabled.Code != http.StatusNotFound {
+		t.Fatalf("disabled user must not resolve: %d %s", disabled.Code, disabled.Body.String())
+	}
+}
+
+func TestPointsIdentitySearchRateLimit(t *testing.T) {
+	service, _, _ := newTestService(t)
+	service.searchLimit = 1
+	handler := routerFor(service)
+	headers := map[string]string{"Authorization": "Bearer " + strings.Repeat("p", 40)}
+	first := doJSON(t, handler, http.MethodPost, "/v1/identity/users/search", "", `{"query":"alice","limit":1}`, headers)
+	second := doJSON(t, handler, http.MethodPost, "/v1/identity/users/search", "", `{"query":"alice","limit":1}`, headers)
+	if first.Code != http.StatusOK || second.Code != http.StatusTooManyRequests {
+		t.Fatalf("rate limit statuses = %d, %d", first.Code, second.Code)
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -36,15 +37,20 @@ var (
 )
 
 type Service struct {
-	cfg          config.Config
-	sessions     session.Store
-	transactions transactionRepository
-	zitadel      zitadelSessionClient
-	oidcMu       sync.Mutex
-	oidcHTTP     *http.Client
-	oauth        oauth2.Config
-	verifier     *oidc.IDTokenVerifier
-	logger       *slog.Logger
+	cfg           config.Config
+	sessions      session.Store
+	transactions  transactionRepository
+	zitadel       zitadelSessionClient
+	oidcMu        sync.Mutex
+	oidcHTTP      *http.Client
+	oauth         oauth2.Config
+	verifier      *oidc.IDTokenVerifier
+	logger        *slog.Logger
+	roleRefresher platformRoleRefresher
+}
+
+type platformRoleRefresher interface {
+	Refresh(context.Context, string, session.Session) (session.Session, error)
 }
 
 type transactionRepository interface {
@@ -62,6 +68,13 @@ type transactionRepository interface {
 	allowAttempt(context.Context, string) (bool, error)
 	ping(context.Context) error
 	close() error
+}
+
+func (s *Service) WithPlatformRoleRefresher(refresher platformRoleRefresher) *Service {
+	if s != nil {
+		s.roleRefresher = refresher
+	}
+	return s
 }
 
 type zitadelSessionClient interface {
@@ -487,18 +500,19 @@ func (s *Service) Password(response http.ResponseWriter, request *http.Request) 
 		return
 	}
 	value := session.Session{
-		AssertionSessionID:    sessionID,
-		Subject:               upstreamSession.Subject,
-		Entitlements:          append([]string(nil), s.cfg.DefaultEntitlements...),
-		PlatformRoles:         s.platformRoles(request.Context(), upstreamSession.Subject),
-		AuthenticationTime:    now,
-		AuthenticationMethods: []string{"pwd"},
-		DisplayName:           firstNonEmpty(upstreamSession.DisplayName, upstreamSession.LoginName),
-		PreferredUsername:     upstreamSession.LoginName,
-		UpstreamSessionID:     upstreamSession.ID,
-		UpstreamSessionToken:  upstreamSession.Token,
-		CreatedAt:             now,
-		LastSeenAt:            now,
+		AssertionSessionID:       sessionID,
+		Subject:                  upstreamSession.Subject,
+		Entitlements:             append([]string(nil), s.cfg.DefaultEntitlements...),
+		PlatformRoles:            s.platformRoles(request.Context(), upstreamSession.Subject),
+		PlatformRolesRefreshedAt: now,
+		AuthenticationTime:       now,
+		AuthenticationMethods:    []string{"pwd"},
+		DisplayName:              firstNonEmpty(upstreamSession.DisplayName, upstreamSession.LoginName),
+		PreferredUsername:        upstreamSession.LoginName,
+		UpstreamSessionID:        upstreamSession.ID,
+		UpstreamSessionToken:     upstreamSession.Token,
+		CreatedAt:                now,
+		LastSeenAt:               now,
 	}
 	if value.Subject == "" {
 		_ = s.zitadel.DeleteSession(request.Context(), upstreamSession.ID, upstreamSession.Token)
@@ -581,17 +595,18 @@ func (s *Service) Callback(response http.ResponseWriter, request *http.Request) 
 	// The business context always starts personal: the ZITADEL resident
 	// organization of the account is identity plumbing, not a tenant.
 	value := session.Session{
-		AssertionSessionID:    sessionID,
-		Subject:               claims.Subject,
-		Entitlements:          append([]string(nil), s.cfg.DefaultEntitlements...),
-		PlatformRoles:         s.platformRoles(request.Context(), claims.Subject),
-		AuthenticationTime:    authenticationTime,
-		AuthenticationMethods: []string{"federated"},
-		Email:                 claims.Email,
-		DisplayName:           firstNonEmpty(claims.Name, claims.PreferredUsername),
-		PreferredUsername:     claims.PreferredUsername,
-		CreatedAt:             now,
-		LastSeenAt:            now,
+		AssertionSessionID:       sessionID,
+		Subject:                  claims.Subject,
+		Entitlements:             append([]string(nil), s.cfg.DefaultEntitlements...),
+		PlatformRoles:            s.platformRoles(request.Context(), claims.Subject),
+		PlatformRolesRefreshedAt: now,
+		AuthenticationTime:       authenticationTime,
+		AuthenticationMethods:    []string{"federated"},
+		Email:                    claims.Email,
+		DisplayName:              firstNonEmpty(claims.Name, claims.PreferredUsername),
+		PreferredUsername:        claims.PreferredUsername,
+		CreatedAt:                now,
+		LastSeenAt:               now,
 	}
 	if err := s.sessions.Put(request.Context(), sessionID, value); err != nil {
 		s.logger.Error("store federated session", "error", err)
@@ -677,17 +692,18 @@ func (s *Service) createFederatedSession(
 		return err
 	}
 	value := session.Session{
-		AssertionSessionID:    sessionID,
-		Subject:               subject,
-		Entitlements:          append([]string(nil), s.cfg.DefaultEntitlements...),
-		PlatformRoles:         s.platformRoles(ctx, subject),
-		AuthenticationTime:    now,
-		AuthenticationMethods: []string{"federated"},
-		Email:                 info.Email,
-		DisplayName:           firstNonEmpty(info.DisplayName, info.UserName),
-		PreferredUsername:     info.UserName,
-		CreatedAt:             now,
-		LastSeenAt:            now,
+		AssertionSessionID:       sessionID,
+		Subject:                  subject,
+		Entitlements:             append([]string(nil), s.cfg.DefaultEntitlements...),
+		PlatformRoles:            s.platformRoles(ctx, subject),
+		PlatformRolesRefreshedAt: now,
+		AuthenticationTime:       now,
+		AuthenticationMethods:    []string{"federated"},
+		Email:                    info.Email,
+		DisplayName:              firstNonEmpty(info.DisplayName, info.UserName),
+		PreferredUsername:        info.UserName,
+		CreatedAt:                now,
+		LastSeenAt:               now,
 	}
 	if err := s.sessions.Put(ctx, sessionID, value); err != nil {
 		return err
@@ -846,6 +862,13 @@ func (s *Service) Session(response http.ResponseWriter, request *http.Request) {
 		"organization":      organization,
 		"roles":             value.Roles,
 		"platformRoles":     value.PlatformRoles,
+		"iamCapabilities": map[string]any{
+			"pointsRoleAssignments": map[string]any{
+				"read":            slices.Contains(value.PlatformRoles, "opc:system-admin"),
+				"write":           slices.Contains(value.PlatformRoles, "opc:system-admin"),
+				"manageableRoles": []string{"platform:points-admin", "platform:points-auditor"},
+			},
+		},
 	})
 }
 
@@ -883,6 +906,15 @@ func (s *Service) currentSession(request *http.Request) (session.Session, string
 	now := time.Now().UTC()
 	if !value.RevokedAt.IsZero() || now.Sub(value.LastSeenAt) > s.cfg.IdleTTL || now.Sub(value.CreatedAt) > s.cfg.AbsoluteTTL {
 		return session.Session{}, "", session.ErrNotFound
+	}
+	if s.roleRefresher != nil {
+		value, err = s.roleRefresher.Refresh(request.Context(), cookie.Value, value)
+		if err != nil {
+			return session.Session{}, "", err
+		}
+		if !value.RevokedAt.IsZero() || now.Sub(value.LastSeenAt) > s.cfg.IdleTTL || now.Sub(value.CreatedAt) > s.cfg.AbsoluteTTL {
+			return session.Session{}, "", session.ErrNotFound
+		}
 	}
 	if now.Sub(value.LastSeenAt) > 5*time.Minute {
 		value.LastSeenAt = now
@@ -969,7 +1001,9 @@ func (s *Service) platformRoles(ctx context.Context, userID string) []string {
 	if s.cfg.ZitadelProjectID == "" || s.cfg.ZitadelOrganizationID == "" {
 		return nil
 	}
-	authorizations, err := s.zitadel.ListAuthorizations(ctx, zitadel.AuthorizationFilter{
+	lookupContext, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	authorizations, err := s.zitadel.ListAuthorizations(lookupContext, zitadel.AuthorizationFilter{
 		UserID:         userID,
 		OrganizationID: s.cfg.ZitadelOrganizationID,
 		ProjectID:      s.cfg.ZitadelProjectID,

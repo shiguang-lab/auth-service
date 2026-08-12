@@ -14,12 +14,15 @@
 
 1. The browser sends the opaque `__Secure-sg_session` cookie to a first-party
    subdomain.
-2. Caddy removes all externally supplied identity headers.
-3. Caddy calls `GET /v1/forward-auth` with the original request metadata and
-   gateway-owned product policy.
+2. Access Gateway removes all externally supplied identity headers.
+3. Access Gateway calls the canonical `POST /v1/authorize` JSON endpoint with
+   the original request metadata, gateway-owned product policy, and
+   `X-SG-Gateway-Token`. `GET /v1/forward-auth` remains a compatibility adapter
+   for existing forward-auth proxies.
 4. Auth Service hashes the cookie value, loads the server-side Redis session,
-   checks expiry, revocation, and required entitlement, and signs an assertion.
-5. Caddy copies only `X-SG-Identity` into the upstream request and removes the
+   checks expiry and revocation, refreshes platform roles when their 60-second
+   cache is stale, checks required entitlement, and signs an assertion.
+5. Access Gateway copies only `X-SG-Identity` into the upstream request and removes the
    browser cookie and bearer credentials before proxying.
 6. The product validates the assertion signature, issuer, audience, expiry, and
    required claims, then performs its own resource authorization.
@@ -75,6 +78,19 @@ content must live on a separate registrable domain.
 - Invalid, missing, duplicate, expired, or revoked session: `401`.
 - Missing product entitlement: `403`.
 - Public routes do not invoke Auth Service.
+
+Platform-role refresh is restricted to active authorizations for the configured
+platform organization and project. Successful refreshes update the optional
+`platform_roles_refreshed_at` Session field. Old encrypted Session JSON omits
+that field and therefore refreshes on first access without a Redis migration.
+Directory failure clears `PlatformRoles` before an assertion or Session response
+is produced, while ordinary entitlements such as `platform:access` remain.
+Concurrent refreshes for one subject are coalesced inside each process.
+
+An administrative role-write API is intentionally deferred. Immediate
+cross-instance revocation will require a Redis `subject -> session IDs` index so
+all sessions for a subject can be refreshed or revoked after a role change; no
+such index or write endpoint exists in this phase.
 
 The gateway should use short auth timeouts, bounded retries only for safe
 transport failures, circuit breaking, rate limits on login endpoints, and

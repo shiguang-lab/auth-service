@@ -111,8 +111,7 @@ for role in \
   "org:viewer|Organization Viewer" \
   "opc:system-admin|OPC 系统管理员" \
   "platform:points-admin|Points Administrator" \
-  "platform:points-auditor|Points Auditor" \
-  "platform:points-integration-admin|Points Integration Administrator"; do
+  "platform:points-auditor|Points Auditor"; do
   key="${role%%|*}"; display="${role#*|}"
   jq -n --arg roleKey "$key" --arg displayName "$display" \
     '{roleKey:$roleKey,displayName:$displayName}' > "$workdir/role-request.json"

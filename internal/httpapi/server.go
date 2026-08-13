@@ -16,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/shiguanglab/auth-service/internal/authorize"
 	"github.com/shiguanglab/auth-service/internal/identity"
+	"github.com/shiguanglab/auth-service/internal/localidentity"
 	loginservice "github.com/shiguanglab/auth-service/internal/login"
 	orgservice "github.com/shiguanglab/auth-service/internal/orgs"
 	"github.com/shiguanglab/auth-service/internal/platformroleadmin"
@@ -30,14 +31,20 @@ const (
 type ReadinessCheck func(context.Context) error
 
 type Server struct {
-	decision     *authorize.Service
-	signer       *identity.Signer
-	gatewayToken [32]byte
-	readiness    ReadinessCheck
-	logger       *slog.Logger
-	login        *loginservice.Service
-	orgs         *orgservice.Service
-	roleAdmin    *platformroleadmin.Service
+	decision      *authorize.Service
+	signer        *identity.Signer
+	gatewayToken  [32]byte
+	readiness     ReadinessCheck
+	logger        *slog.Logger
+	login         *loginservice.Service
+	orgs          *orgservice.Service
+	roleAdmin     *platformroleadmin.Service
+	localIdentity *localidentity.Service
+}
+
+func (s *Server) WithLocalIdentity(service *localidentity.Service) *Server {
+	s.localIdentity = service
+	return s
 }
 
 // WithPlatformRoleAdmin mounts the narrowly-scoped Points IAM role API. The
@@ -90,6 +97,25 @@ func (s *Server) Handler() http.Handler {
 	router.Get("/.well-known/jwks.json", s.handleJWKS)
 	router.With(s.authenticateGateway).Get("/v1/forward-auth", s.handleForwardAuth)
 	router.With(s.authenticateGateway).Post("/v1/authorize", s.handleAuthorize)
+	if s.localIdentity != nil {
+		router.Group(func(local chi.Router) {
+			local.Use(s.authenticateGateway)
+			local.Get("/login", s.localIdentity.LoginPage)
+			local.Post("/api/auth/local/login", s.localIdentity.Login)
+			local.Get("/api/auth/session", s.localIdentity.Session)
+			local.Post("/api/auth/logout", s.localIdentity.Logout)
+			if s.roleAdmin != nil {
+				local.Post("/api/auth/iam/points-role-assignments/search", s.roleAdmin.SearchHandler)
+				local.Post("/api/auth/iam/points-role-assignments/resolve", s.roleAdmin.ResolveHandler)
+				local.Put("/api/auth/iam/points-role-assignments/{userID}", s.roleAdmin.UpdateHandler)
+			}
+			local.Post("/api/auth/local/provider/fail-next", s.localIdentity.FailNextProviderWrite)
+			local.Get("/api/auth/local/iam-commands", s.localIdentity.ListCommands)
+			local.Post("/api/auth/local/iam-commands/{operationID}/retry", s.localIdentity.RetryCommand)
+		})
+		router.Post("/v1/identity/users/search", s.localIdentity.SearchIdentityUsers)
+		router.Post("/v1/identity/users/resolve", s.localIdentity.ResolveIdentityUser)
+	}
 	if s.login != nil {
 		router.Group(func(auth chi.Router) {
 			auth.Use(s.authenticateGateway)

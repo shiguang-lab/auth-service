@@ -40,6 +40,10 @@ type Config struct {
 	IAMRoleAdminOrigins        []string
 	IAMRoleCommandPrefix       string
 	IAMRoleCommandTTL          time.Duration
+	LocalIdentityFixture       bool
+	LocalIdentityOrigin        string
+	LocalIdentityServiceToken  string
+	LocalIdentityRedisPrefix   string
 	DefaultEntitlements        []string
 	IdentityIssuer             string
 	SigningKeyFile             string
@@ -102,6 +106,10 @@ func Load() (Config, error) {
 		IAMRoleAdminOrigins:        splitCSV(envOr("IAM_ROLE_ADMIN_ORIGINS", "https://points.shiguanglab.com")),
 		IAMRoleCommandPrefix:       envOr("IAM_ROLE_COMMAND_PREFIX", "auth:iam-role-command:"),
 		IAMRoleCommandTTL:          iamRoleCommandTTL,
+		LocalIdentityFixture:       os.Getenv("LOCAL_IDENTITY_FIXTURE") == "1",
+		LocalIdentityOrigin:        strings.TrimRight(strings.TrimSpace(os.Getenv("LOCAL_IDENTITY_ORIGIN")), "/"),
+		LocalIdentityServiceToken:  strings.TrimSpace(os.Getenv("LOCAL_IDENTITY_SERVICE_TOKEN")),
+		LocalIdentityRedisPrefix:   envOr("LOCAL_IDENTITY_REDIS_PREFIX", "auth:local-identity:"),
 		DefaultEntitlements:        splitCSV(envOr("DEFAULT_ENTITLEMENTS", "superagents:access,huiguang:access,platform:access")),
 		IdentityIssuer:             envOr("IDENTITY_ISSUER", "https://auth.shiguanglab.com"),
 		SigningKeyFile:             strings.TrimSpace(os.Getenv("IDENTITY_SIGNING_KEY_FILE")),
@@ -163,6 +171,24 @@ func (c Config) Validate() error {
 		}
 		if len(c.PointsIdentityServiceToken) < 32 {
 			return errors.New("POINTS_IDENTITY_SERVICE_TOKEN must contain at least 32 characters in production")
+		}
+	}
+	if c.LocalIdentityFixture {
+		if c.Environment == "production" {
+			return errors.New("LOCAL_IDENTITY_FIXTURE is forbidden in production")
+		}
+		if c.SessionBackend != "redis" {
+			return errors.New("LOCAL_IDENTITY_FIXTURE requires the redis session backend")
+		}
+		parsed, err := url.Parse(c.LocalIdentityOrigin)
+		if err != nil || parsed.Scheme != "http" || (parsed.Hostname() != "127.0.0.1" && parsed.Hostname() != "localhost") || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
+			return errors.New("LOCAL_IDENTITY_ORIGIN must be an exact localhost HTTP origin")
+		}
+		if len(c.LocalIdentityServiceToken) < 32 {
+			return errors.New("LOCAL_IDENTITY_SERVICE_TOKEN must contain at least 32 characters")
+		}
+		if c.LocalIdentityRedisPrefix == "" || !strings.HasSuffix(c.LocalIdentityRedisPrefix, ":") {
+			return errors.New("LOCAL_IDENTITY_REDIS_PREFIX must end with a colon")
 		}
 	}
 	for _, origin := range c.AllowedReturnOrigins {

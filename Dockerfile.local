@@ -1,0 +1,13 @@
+FROM golang:1.26.5-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/auth-service ./cmd/auth-service
+
+FROM build AS test
+
+FROM golang:1.26.5-alpine
+COPY --from=build /out/auth-service /usr/local/bin/auth-service
+EXPOSE 8081
+ENTRYPOINT ["/usr/local/bin/auth-service"]

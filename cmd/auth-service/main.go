@@ -16,6 +16,7 @@ import (
 	"github.com/shiguanglab/auth-service/internal/config"
 	"github.com/shiguanglab/auth-service/internal/httpapi"
 	"github.com/shiguanglab/auth-service/internal/identity"
+	"github.com/shiguanglab/auth-service/internal/localidentity"
 	loginservice "github.com/shiguanglab/auth-service/internal/login"
 	orgservice "github.com/shiguanglab/auth-service/internal/orgs"
 	"github.com/shiguanglab/auth-service/internal/platformroleadmin"
@@ -72,12 +73,56 @@ func main() {
 		os.Exit(1)
 	}
 	defer func() {
-		if err := login.Close(); err != nil {
-			logger.Error("close login service", "error", err)
+		if login != nil {
+			if err := login.Close(); err != nil {
+				logger.Error("close login service", "error", err)
+			}
 		}
 	}()
 
+	var localFixture *localidentity.Service
+	var localExecutor *platformroleadmin.DurableChangeExecutor
+	if cfg.LocalIdentityFixture {
+		localFixture, err = localidentity.New(localidentity.Config{
+			Origin:         cfg.LocalIdentityOrigin,
+			CookieName:     cfg.SessionCookieName,
+			CookieTTL:      cfg.AbsoluteTTL,
+			IdentityIssuer: cfg.IdentityIssuer,
+			IdentityToken:  cfg.LocalIdentityServiceToken,
+			RedisPrefix:    cfg.LocalIdentityRedisPrefix,
+		}, store, redisOptions, logger)
+		if err != nil {
+			logger.Error("initialize local identity fixture", "error", err)
+			os.Exit(1)
+		}
+		defer func() {
+			if err := localFixture.Close(); err != nil {
+				logger.Error("close local identity fixture", "error", err)
+			}
+		}()
+		if roleCommandJournal == nil {
+			logger.Error("local identity fixture requires IAM command journal")
+			os.Exit(1)
+		}
+		localExecutor, err = platformroleadmin.NewDurableChangeExecutor(roleCommandJournal, localFixture, cfg.IAMRoleCommandTTL, 10*time.Second)
+		if err != nil {
+			logger.Error("initialize local IAM role executor", "error", err)
+			os.Exit(1)
+		}
+		localFixture.SetExecutor(localExecutor)
+		seedContext, cancelSeed := context.WithTimeout(context.Background(), 5*time.Second)
+		err = localFixture.Seed(seedContext)
+		cancelSeed()
+		if err != nil {
+			logger.Error("seed local identity fixture", "error", err)
+			os.Exit(1)
+		}
+	}
+
 	decision := authorize.NewService(store, signer, cfg.SessionCookieName, cfg.IdleTTL, cfg.AbsoluteTTL)
+	if localFixture != nil {
+		decision.WithPlatformRoleRefresher(localFixture)
+	}
 	var directory *zitadel.Client
 	if login != nil && cfg.ZitadelProjectID != "" {
 		directory, err = zitadel.NewClient(
@@ -99,8 +144,15 @@ func main() {
 		if err := store.Ping(ctx); err != nil {
 			return err
 		}
-		if err := login.Ping(ctx); err != nil {
-			return err
+		if login != nil {
+			if err := login.Ping(ctx); err != nil {
+				return err
+			}
+		}
+		if localFixture != nil {
+			if err := localFixture.Ping(ctx); err != nil {
+				return err
+			}
 		}
 		if roleCommandJournal != nil {
 			return roleCommandJournal.Ping(ctx)
@@ -108,7 +160,10 @@ func main() {
 		return nil
 	}
 	api := httpapi.NewServer(decision, signer, cfg.GatewayToken, readiness, logger, login)
-	if login != nil {
+	if localFixture != nil {
+		api.WithLocalIdentity(localFixture)
+		api.WithPlatformRoleAdmin(platformroleadmin.NewService(localFixture, localFixture, localExecutor, localFixture, cfg.IAMRoleAdminOrigins, logger))
+	} else if login != nil {
 		// The Redis command journal is ready when configured, but the executor
 		// remains nil until a ZITADEL writer and permanent audit sink are approved.
 		api.WithPlatformRoleAdmin(platformroleadmin.NewService(login, nil, nil, nil, cfg.IAMRoleAdminOrigins, logger))

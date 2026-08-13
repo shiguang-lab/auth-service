@@ -184,3 +184,44 @@ func TestParseProviderIDsRejectsMalformedEntries(t *testing.T) {
 		})
 	}
 }
+
+func TestLocalIdentityFixtureValidation(t *testing.T) {
+	base := Config{
+		Environment: "development", GatewayToken: strings.Repeat("g", 32),
+		SessionBackend: "redis", SessionCookieName: "sg_local_session",
+		SessionEncryptionKey: make([]byte, 32), RedisURL: "redis://127.0.0.1:6379/0",
+		IdentityIssuer: "http://auth-service:8081", SigningKeyID: "local-key",
+		IdentityTokenTTL: time.Minute, IdleTTL: time.Hour, AbsoluteTTL: 24 * time.Hour,
+		IAMRoleAdminOrigins:  []string{"http://127.0.0.1:18080"},
+		LocalIdentityFixture: true, LocalIdentityOrigin: "http://127.0.0.1:18080",
+		LocalIdentityServiceToken: strings.Repeat("l", 32), LocalIdentityRedisPrefix: "auth:local-test:",
+	}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("valid local identity fixture: %v", err)
+	}
+
+	production := base
+	production.Environment = "production"
+	production.SigningKeyFile = "/run/secrets/local-test.pem"
+	production.PublicOrigin = "https://shiguanglab.com"
+	production.ZitadelIssuer = "https://sso.shiguanglab.com"
+	production.ZitadelInternalURL = "http://zitadel-api:8080"
+	production.ZitadelPATFile = "/run/secrets/zitadel.pat"
+	production.ZitadelRegistrationPATFile = "/run/secrets/zitadel-registration.pat"
+	production.ZitadelOrganizationID = "org"
+	production.ZitadelProjectID = "project"
+	production.IdentityAPIToken = strings.Repeat("i", 32)
+	production.PointsIdentityServiceToken = strings.Repeat("p", 32)
+	production.OIDCClientID = "client"
+	production.OIDCClientSecret = "secret"
+	production.OIDCRedirectURL = "https://shiguanglab.com/api/auth/oidc/callback"
+	if err := production.Validate(); err == nil || !strings.Contains(err.Error(), "forbidden in production") {
+		t.Fatalf("production fixture error = %v", err)
+	}
+
+	remote := base
+	remote.LocalIdentityOrigin = "http://auth.example.test"
+	if err := remote.Validate(); err == nil || !strings.Contains(err.Error(), "localhost") {
+		t.Fatalf("remote fixture origin error = %v", err)
+	}
+}

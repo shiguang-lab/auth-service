@@ -486,4 +486,291 @@ func writeJSON(response http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(response).Encode(value)
 }
 
-var loginPage = template.Must(template.New("local-login").Parse(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>拾光本地统一登录</title></head><body><main><h1>拾光本地统一登录</h1><p>仅用于无密钥本地契约验收。</p><form id="login"><input type="hidden" name="returnTo" value="{{.ReturnTo}}"><label>身份<select name="userId">{{range .Users}}<option value="{{.ID}}">{{.DisplayName}} ({{.ID}})</option>{{end}}</select></label><button type="submit">登录并返回积分系统</button></form><pre id="status"></pre></main><script>document.getElementById('login').addEventListener('submit',async(e)=>{e.preventDefault();const f=new FormData(e.target);const r=await fetch('/api/auth/local/login',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({userId:f.get('userId'),returnTo:f.get('returnTo')})});const b=await r.json();if(r.ok)location.assign(b.redirect);else document.getElementById('status').textContent=b.error||'login_failed'});</script></body></html>`))
+func fixtureRoleDescription(user fixtureUser) string {
+	switch {
+	case slices.Contains(user.Roles, platformroleadmin.IAMManagerRole):
+		return "积分平台角色授予与撤销，仅限 IAM 管理员"
+	case slices.Contains(user.Roles, platformroleadmin.PointsAdminRole):
+		return "平台账户、应用、成员、账本与人工调整"
+	case slices.Contains(user.Roles, platformroleadmin.PointsAuditorRole):
+		return "全局账户、账本与审计只读"
+	case user.ID == "local-owner" || user.ID == "local-other-owner":
+		return "所属应用、凭据与应用账本，仅限已授权应用"
+	default:
+		return "个人积分、每日签到与个人账本"
+	}
+}
+
+var loginPage = template.Must(template.New("local-login").Funcs(template.FuncMap{
+	"roleDescription": fixtureRoleDescription,
+}).Parse(`<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>拾光统一登录 · 积分系统</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #030a0d;
+      --bg-raised: #061115;
+      --surface: #0b151b;
+      --surface-strong: #101d24;
+      --input: #081217;
+      --line: #193036;
+      --line-soft: #14272c;
+      --text: #edf7f4;
+      --body: #b8c6c8;
+      --muted: #829499;
+      --violet: #9b6cff;
+      --violet-soft: #c7b4ff;
+      --cyan: #55c8d8;
+      --green: #49d27a;
+      --green-strong: #25a95a;
+      --gold: #d7ae46;
+      --danger: #ff6673;
+      --radius: 8px;
+      font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    * { box-sizing: border-box; }
+    html, body { min-height: 100%; margin: 0; }
+    body {
+      min-width: 320px;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 15px;
+      line-height: 1.55;
+    }
+    button, select { font: inherit; }
+    .page-shell { min-height: 100vh; display: flex; flex-direction: column; }
+    .brandbar {
+      width: min(1180px, calc(100% - 48px));
+      margin: 0 auto;
+      min-height: 72px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      border-bottom: 1px solid var(--line-soft);
+      color: var(--body);
+    }
+    .brand-mark {
+      width: 30px;
+      height: 30px;
+      display: inline-grid;
+      place-items: center;
+      border: 1px solid var(--violet);
+      border-radius: 6px;
+      color: var(--violet-soft);
+      font-size: 14px;
+      font-weight: 750;
+      letter-spacing: 0;
+    }
+    .brand-name { color: var(--text); font-weight: 700; letter-spacing: 0; }
+    .brand-divider { color: var(--line); }
+    .brand-product { color: var(--body); }
+    .env-badge {
+      margin-left: auto;
+      padding: 4px 9px;
+      border: 1px solid #2b5a63;
+      border-radius: 5px;
+      color: var(--cyan);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0;
+      white-space: nowrap;
+    }
+    .login-layout {
+      width: min(980px, calc(100% - 48px));
+      margin: auto;
+      padding: 64px 0 72px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(360px, 460px);
+      align-items: center;
+      gap: 72px;
+    }
+    .intro { max-width: 400px; }
+    .eyebrow {
+      margin: 0 0 16px;
+      color: var(--green);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+    h1 { margin: 0; font-size: 42px; line-height: 1.18; letter-spacing: 0; }
+    .intro-copy { margin: 18px 0 0; color: var(--body); font-size: 16px; }
+    .scope-list { margin: 28px 0 0; padding: 0; list-style: none; display: grid; gap: 12px; }
+    .scope-list li { display: flex; align-items: baseline; gap: 10px; color: var(--muted); }
+    .scope-list strong { color: var(--text); font-weight: 600; }
+    .scope-list span { color: var(--cyan); }
+    .panel {
+      padding: 28px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: 0 18px 44px rgba(0, 0, 0, .22);
+    }
+    .panel-kicker { color: var(--violet-soft); font-size: 12px; font-weight: 700; letter-spacing: 0; text-transform: uppercase; }
+    .panel h2 { margin: 8px 0 6px; font-size: 24px; line-height: 1.25; }
+    .panel-lede { margin: 0 0 24px; color: var(--muted); }
+    form { display: grid; gap: 16px; }
+    label { color: var(--body); font-size: 13px; font-weight: 600; }
+    select {
+      display: block;
+      width: 100%;
+      min-height: 46px;
+      margin-top: 7px;
+      padding: 0 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--input);
+      color: var(--text);
+      cursor: pointer;
+    }
+    select:hover { border-color: #2b5961; }
+    select:focus-visible, button:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }
+    .identity-detail, .return-target {
+      padding: 13px 14px;
+      border: 1px solid var(--line-soft);
+      border-radius: 6px;
+      background: var(--bg-raised);
+    }
+    .detail-label, .return-label { display: block; color: var(--muted); font-size: 11px; letter-spacing: 0; text-transform: uppercase; }
+    .identity-detail p { margin: 4px 0 0; color: var(--body); }
+    .return-target code {
+      display: block;
+      margin-top: 4px;
+      overflow-wrap: anywhere;
+      color: var(--gold);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+    }
+    button {
+      min-height: 46px;
+      border: 1px solid var(--green-strong);
+      border-radius: 6px;
+      background: var(--green-strong);
+      color: #04110a;
+      font-weight: 750;
+      cursor: pointer;
+      transition: background-color .15s ease, border-color .15s ease;
+    }
+    button:hover:not(:disabled) { border-color: var(--green); background: var(--green); }
+    button:disabled { cursor: wait; opacity: .7; }
+    .status { min-height: 24px; margin: -4px 0 0; color: var(--muted); font-size: 13px; }
+    .status--busy { color: var(--cyan); }
+    .status--error { color: var(--danger); }
+    .security-note { margin: 20px 0 0; padding-top: 16px; border-top: 1px solid var(--line-soft); color: var(--muted); font-size: 12px; }
+    .footer { width: min(1180px, calc(100% - 48px)); margin: 0 auto; padding: 0 0 22px; color: var(--muted); font-size: 12px; }
+    @media (max-width: 760px) {
+      .brandbar, .footer, .login-layout { width: min(100% - 32px, 560px); }
+      .login-layout { grid-template-columns: 1fr; gap: 28px; padding: 36px 0 44px; }
+      .intro { max-width: none; }
+      h1 { font-size: 36px; }
+      .intro-copy { margin-top: 12px; }
+      .scope-list { display: none; }
+      .panel { padding: 22px 18px; }
+    }
+    @media (max-width: 420px) {
+      .brandbar { min-height: 62px; }
+      .brand-divider, .brand-product { display: none; }
+      .env-badge { margin-left: auto; }
+      .login-layout { width: calc(100% - 24px); padding-top: 30px; }
+      h1 { font-size: 30px; }
+      .panel h2 { font-size: 22px; }
+      .footer { width: calc(100% - 24px); }
+    }
+  </style>
+</head>
+<body>
+  <div class="page-shell">
+    <header class="brandbar" aria-label="拾光积分系统">
+      <span class="brand-mark" aria-hidden="true">S</span>
+      <span class="brand-name">拾光本地统一登录</span>
+      <span class="brand-divider" aria-hidden="true">/</span>
+      <span class="brand-product">积分系统</span>
+      <span class="env-badge">LOCAL · 无密钥验收</span>
+    </header>
+    <main class="login-layout">
+      <section class="intro" aria-labelledby="intro-title">
+        <p class="eyebrow">Shiguang points</p>
+        <h1 id="intro-title">进入积分工作台</h1>
+        <p class="intro-copy">使用拾光统一身份进入本地积分系统，验证个人积分、应用权限与平台管理流程。</p>
+        <ul class="scope-list" aria-label="本地验收范围">
+          <li><span aria-hidden="true">01</span><strong>统一会话</strong> <span>登录、回跳与退出</span></li>
+          <li><span aria-hidden="true">02</span><strong>权限边界</strong> <span>个人、应用与平台角色</span></li>
+          <li><span aria-hidden="true">03</span><strong>积分中台</strong> <span>账本、凭据与审计</span></li>
+        </ul>
+      </section>
+      <section class="panel" aria-labelledby="login-title">
+        <div class="panel-kicker">统一身份认证</div>
+        <h2 id="login-title">选择验收身份</h2>
+        <p class="panel-lede">这是本地无密钥夹具，仅提供预置身份，不接受任意用户输入。</p>
+        <form id="login" novalidate>
+          <input type="hidden" name="returnTo" value="{{.ReturnTo}}">
+          <label for="userId">登录身份
+            <select id="userId" name="userId" autocomplete="off" required>
+              {{range .Users}}<option value="{{.ID}}" data-description="{{roleDescription .}}">{{.DisplayName}} · {{.LoginName}}</option>{{end}}
+            </select>
+          </label>
+          <div class="identity-detail">
+            <span class="detail-label">该身份可验证</span>
+            <p id="roleDescription" aria-live="polite">{{roleDescription (index .Users 0)}}</p>
+          </div>
+          <div class="return-target">
+            <span class="return-label">登录后返回</span>
+            <code>{{.ReturnTo}}</code>
+          </div>
+          <button id="submitLogin" type="submit"><span id="buttonLabel">登录并返回积分系统</span></button>
+          <p id="status" class="status" role="status" aria-live="polite"></p>
+        </form>
+        <p class="security-note">登录状态仅用于本机验收，会话通过同源安全 Cookie 保存。</p>
+      </section>
+    </main>
+    <footer class="footer">拾光积分系统 · 本地开发夹具 · 不连接生产身份服务</footer>
+  </div>
+  <script>
+    (() => {
+      const form = document.getElementById('login');
+      const select = document.getElementById('userId');
+      const description = document.getElementById('roleDescription');
+      const status = document.getElementById('status');
+      const button = document.getElementById('submitLogin');
+      const buttonLabel = document.getElementById('buttonLabel');
+      const idleLabel = buttonLabel.textContent;
+      select.addEventListener('change', () => {
+        description.textContent = select.selectedOptions[0]?.dataset.description || '';
+      });
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        if (button.disabled) return;
+        button.disabled = true;
+        buttonLabel.textContent = '正在建立本地会话…';
+        status.className = 'status status--busy';
+        status.textContent = '正在验证身份，请稍候。';
+        const formData = new FormData(form);
+        try {
+          const response = await fetch('/api/auth/local/login', {
+            method: 'POST', credentials: 'include',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({userId: formData.get('userId'), returnTo: formData.get('returnTo')})
+          });
+          const body = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(body.error || 'login_failed');
+          if (typeof body.redirect !== 'string') throw new Error('invalid_redirect');
+          status.textContent = '登录成功，正在返回积分系统。';
+          window.location.assign(body.redirect);
+        } catch (error) {
+          status.className = 'status status--error';
+          status.textContent = error instanceof Error ? error.message : 'login_failed';
+          button.disabled = false;
+          buttonLabel.textContent = idleLabel;
+        }
+      });
+    })();
+  </script>
+</body>
+</html>`))

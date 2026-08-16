@@ -538,10 +538,12 @@ func (s *Service) CreateLocalBroker(
 	clientKey string,
 	loginName string,
 	password string,
+	productID string,
 	ttl time.Duration,
 ) (string, session.Session, error) {
 	loginName = strings.TrimSpace(loginName)
-	if loginName == "" || password == "" || len(loginName) > 320 || len(password) > 1024 {
+	productID = strings.TrimSpace(productID)
+	if loginName == "" || password == "" || productID == "" || len(loginName) > 320 || len(password) > 1024 {
 		return "", session.Session{}, ErrBrokerInvalidCredentials
 	}
 	allowed, err := s.transactions.allowAttempt(
@@ -582,6 +584,7 @@ func (s *Service) CreateLocalBroker(
 		LastSeenAt:               now,
 		CredentialKind:           session.CredentialKindLocalBroker,
 		CredentialExpiresAt:      now.Add(ttl),
+		BrokerProductID:          productID,
 	}
 	if value.Subject == "" {
 		_ = s.zitadel.DeleteSession(ctx, upstreamSession.ID, upstreamSession.Token)
@@ -602,6 +605,7 @@ func (s *Service) ResolveLocalBroker(ctx context.Context, brokerToken string) (s
 	now := time.Now().UTC()
 	if value.CredentialKind != session.CredentialKindLocalBroker ||
 		value.Subject == "" ||
+		value.BrokerProductID == "" ||
 		value.CredentialExpiresAt.IsZero() ||
 		!now.Before(value.CredentialExpiresAt) ||
 		!value.RevokedAt.IsZero() {

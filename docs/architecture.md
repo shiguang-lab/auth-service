@@ -51,22 +51,23 @@ Products that run their Web and API on localhost may opt into the production
 Local Broker. This is a server-to-server password grant for a configured test
 account, not a browser login or an impersonation API:
 
-1. The localhost Node proxy posts the configured login name and password to
-   `POST /api/auth/local-broker`.
+1. The localhost Node proxy posts the configured login name, password, and a
+   server-allowlisted `productId` to `POST /api/auth/local-broker`.
 2. Auth Service authenticates the account with ZITADEL, stores a random opaque
    broker credential in Redis, and returns it only to the Node process.
 3. The proxy refreshes through `POST /api/auth/local-broker/refresh`; Auth
-   Service issues a normal short-lived identity assertion for the single
-   configured product, audience, and entitlement policy.
+   Service issues a normal short-lived identity assertion for the product
+   policy bound to that broker credential.
 4. The proxy removes browser `Cookie`, `Authorization`, and identity headers,
    then injects the signed assertion into localhost API/SSE/upload/download
    requests.
 
 Browser sessions and broker credentials have distinct credential kinds and
-cannot be substituted for each other. The broker routes are absent unless
-`LOCAL_BROKER_ENABLED=true`; TTL is capped at 24 hours, the origin is fixed to
-`PUBLIC_ORIGIN`, login attempts are rate-limited, and callers cannot choose a
-subject, audience, or entitlement.
+cannot be substituted for each other. Each broker is bound to one product and
+cannot refresh into another allowlisted product. The broker routes are absent
+unless `LOCAL_BROKER_ENABLED=true`; TTL is capped at 24 hours, the origin is
+fixed to `PUBLIC_ORIGIN`, login attempts are rate-limited, and callers cannot
+choose a subject, audience, or entitlement.
 
 ## Token separation
 

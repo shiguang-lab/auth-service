@@ -311,13 +311,13 @@ func TestCreateLocalBrokerStoresBrokerOnlyCredential(t *testing.T) {
 	}
 
 	brokerToken, value, err := service.CreateLocalBroker(
-		context.Background(), "127.0.0.1", "alice@example.com", "correct horse", 12*time.Hour,
+		context.Background(), "127.0.0.1", "alice@example.com", "correct horse", "opc", 12*time.Hour,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if brokerToken == "" || value.CredentialKind != session.CredentialKindLocalBroker ||
-		value.Subject != "zitadel-user" || value.CredentialExpiresAt.IsZero() {
+		value.Subject != "zitadel-user" || value.BrokerProductID != "opc" || value.CredentialExpiresAt.IsZero() {
 		t.Fatalf("broker token=%q session=%#v", brokerToken, value)
 	}
 	stored, err := sessions.Get(context.Background(), brokerToken)
@@ -345,7 +345,7 @@ func TestCreateLocalBrokerRejectsInvalidCredentialsWithoutPersisting(t *testing.
 	upstream.err = &zitadel.APIError{StatusCode: http.StatusUnauthorized}
 
 	brokerToken, _, err := service.CreateLocalBroker(
-		context.Background(), "127.0.0.1", "alice@example.com", "wrong", time.Hour,
+		context.Background(), "127.0.0.1", "alice@example.com", "wrong", "opc", time.Hour,
 	)
 	if !errors.Is(err, ErrBrokerInvalidCredentials) || brokerToken != "" {
 		t.Fatalf("token=%q err=%v", brokerToken, err)

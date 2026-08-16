@@ -42,7 +42,7 @@ type Server struct {
 	orgs          *orgservice.Service
 	roleAdmin     *platformroleadmin.Service
 	localIdentity *localidentity.Service
-	localBroker   *LocalBrokerPolicy
+	localBrokers  map[string]LocalBrokerPolicy
 }
 
 type LocalBrokerPolicy struct {
@@ -61,7 +61,10 @@ func (s *Server) WithLocalIdentity(service *localidentity.Service) *Server {
 
 func (s *Server) WithLocalBroker(policy LocalBrokerPolicy) *Server {
 	policy.RequiredEntitlements = append([]string(nil), policy.RequiredEntitlements...)
-	s.localBroker = &policy
+	if s.localBrokers == nil {
+		s.localBrokers = make(map[string]LocalBrokerPolicy)
+	}
+	s.localBrokers[policy.ProductID] = policy
 	return s
 }
 
@@ -151,7 +154,7 @@ func (s *Server) Handler() http.Handler {
 			auth.Get("/api/auth/idp-links", s.login.ListIDPLinks)
 			auth.Get("/api/auth/session", s.login.Session)
 			auth.Post("/api/auth/logout", s.login.Logout)
-			if s.localBroker != nil {
+			if len(s.localBrokers) > 0 {
 				auth.Post("/api/auth/local-broker", s.handleLocalBrokerLogin)
 				auth.Post("/api/auth/local-broker/refresh", s.handleLocalBrokerRefresh)
 			}
@@ -194,9 +197,19 @@ func (s *Server) handleLocalBrokerLogin(response http.ResponseWriter, request *h
 	var input struct {
 		LoginName string `json:"loginName"`
 		Password  string `json:"password"`
+		ProductID string `json:"productId"`
 	}
 	if err := decodeBrokerJSON(response, request, &input); err != nil {
 		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	policy, ok := s.localBrokers[strings.TrimSpace(input.ProductID)]
+	if !ok {
+		writeJSON(response, http.StatusForbidden, map[string]string{"error": "invalid_product"})
+		return
+	}
+	if request.Header.Get("Origin") != policy.PublicOrigin {
+		writeJSON(response, http.StatusForbidden, map[string]string{"error": "invalid_origin"})
 		return
 	}
 	brokerToken, value, err := s.login.CreateLocalBroker(
@@ -204,7 +217,8 @@ func (s *Server) handleLocalBrokerLogin(response http.ResponseWriter, request *h
 		brokerClientKey(request),
 		input.LoginName,
 		input.Password,
-		s.localBroker.BrokerTTL,
+		policy.ProductID,
+		policy.BrokerTTL,
 	)
 	if err != nil {
 		switch {
@@ -218,7 +232,7 @@ func (s *Server) handleLocalBrokerLogin(response http.ResponseWriter, request *h
 		}
 		return
 	}
-	s.writeLocalBrokerResponse(response, request, brokerToken, value)
+	s.writeLocalBrokerResponse(response, request, brokerToken, value, policy)
 }
 
 func (s *Server) handleLocalBrokerRefresh(response http.ResponseWriter, request *http.Request) {
@@ -232,7 +246,16 @@ func (s *Server) handleLocalBrokerRefresh(response http.ResponseWriter, request 
 		writeJSON(response, http.StatusUnauthorized, map[string]string{"error": "broker_invalid"})
 		return
 	}
-	s.writeLocalBrokerResponse(response, request, brokerToken, value)
+	policy, ok := s.localBrokers[value.BrokerProductID]
+	if !ok {
+		writeJSON(response, http.StatusUnauthorized, map[string]string{"error": "broker_invalid"})
+		return
+	}
+	if request.Header.Get("Origin") != policy.PublicOrigin {
+		writeJSON(response, http.StatusForbidden, map[string]string{"error": "invalid_origin"})
+		return
+	}
+	s.writeLocalBrokerResponse(response, request, brokerToken, value, policy)
 }
 
 func (s *Server) writeLocalBrokerResponse(
@@ -240,8 +263,8 @@ func (s *Server) writeLocalBrokerResponse(
 	request *http.Request,
 	brokerToken string,
 	value session.Session,
+	policy LocalBrokerPolicy,
 ) {
-	policy := s.localBroker
 	decision := s.decision.DecideBroker(request.Context(), brokerToken, authorize.Request{
 		ProductID:            policy.ProductID,
 		Audience:             policy.Audience,
@@ -276,7 +299,13 @@ func (s *Server) writeLocalBrokerResponse(
 }
 
 func (s *Server) validLocalBrokerOrigin(request *http.Request) bool {
-	return s.localBroker != nil && request.Header.Get("Origin") == s.localBroker.PublicOrigin
+	origin := request.Header.Get("Origin")
+	for _, policy := range s.localBrokers {
+		if origin == policy.PublicOrigin {
+			return true
+		}
+	}
+	return false
 }
 
 func decodeBrokerJSON(response http.ResponseWriter, request *http.Request, value any) error {

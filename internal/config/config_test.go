@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -242,5 +243,31 @@ func TestLocalBrokerRequiresFixedProductPolicyAndDefaultEntitlement(t *testing.T
 	cfg.DefaultEntitlements = append(cfg.DefaultEntitlements, "asset-hub:access")
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("validate local broker config: %v", err)
+	}
+}
+
+func TestLocalBrokerSupportsMultipleServerOwnedProductPolicies(t *testing.T) {
+	t.Setenv("LOCAL_BROKER_POLICIES", `[
+		{"productId":"asset-hub","audience":"asset-hub-api","requiredEntitlements":["asset-hub:access"]},
+		{"productId":"opc","audience":"superagents-bff","requiredEntitlements":["superagents:access"]}
+	]`)
+	policies, err := parseLocalBrokerPolicies(os.Getenv("LOCAL_BROKER_POLICIES"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{
+		Environment: "development", GatewayToken: strings.Repeat("x", 32), SessionBackend: "memory",
+		SessionCookieName: "session", IdentityIssuer: "https://auth.shiguanglab.com", SigningKeyID: "key",
+		IdentityTokenTTL: time.Minute, IdleTTL: time.Hour, AbsoluteTTL: 24 * time.Hour,
+		IAMRoleAdminOrigins: []string{"http://127.0.0.1:3002"},
+		DefaultEntitlements: []string{"asset-hub:access", "superagents:access"}, LocalBrokerEnabled: true,
+		LocalBrokerPolicies: policies, LocalBrokerTTL: 12 * time.Hour,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate multi-product broker config: %v", err)
+	}
+	cfg.LocalBrokerPolicies = append(cfg.LocalBrokerPolicies, cfg.LocalBrokerPolicies[0])
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("expected duplicate product error, got %v", err)
 	}
 }

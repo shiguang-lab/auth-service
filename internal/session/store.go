@@ -36,6 +36,7 @@ type Session struct {
 	RevokedAt                time.Time `json:"revoked_at,omitempty"`
 	CredentialKind           string    `json:"credential_kind,omitempty"`
 	CredentialExpiresAt      time.Time `json:"credential_expires_at,omitempty"`
+	BrokerProductID          string    `json:"broker_product_id,omitempty"`
 }
 
 type Store interface {

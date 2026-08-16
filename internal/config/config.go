@@ -2,8 +2,10 @@ package config
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"regexp"
@@ -11,7 +13,16 @@ import (
 	"time"
 )
 
-var providerTokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+var (
+	providerTokenPattern    = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+	entitlementTokenPattern = regexp.MustCompile(`^[A-Za-z0-9_:-]+$`)
+)
+
+type LocalBrokerProductPolicy struct {
+	ProductID            string   `json:"productId"`
+	Audience             string   `json:"audience"`
+	RequiredEntitlements []string `json:"requiredEntitlements"`
+}
 
 type Config struct {
 	Addr                       string
@@ -55,6 +66,7 @@ type Config struct {
 	LocalBrokerProductID       string
 	LocalBrokerAudience        string
 	LocalBrokerEntitlements    []string
+	LocalBrokerPolicies        []LocalBrokerProductPolicy
 	LocalBrokerTTL             time.Duration
 }
 
@@ -84,6 +96,10 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	providerIDs, err := parseProviderIDs(os.Getenv("OIDC_PROVIDER_IDS"))
+	if err != nil {
+		return Config{}, err
+	}
+	localBrokerPolicies, err := parseLocalBrokerPolicies(os.Getenv("LOCAL_BROKER_POLICIES"))
 	if err != nil {
 		return Config{}, err
 	}
@@ -130,6 +146,7 @@ func Load() (Config, error) {
 		LocalBrokerProductID:       strings.TrimSpace(os.Getenv("LOCAL_BROKER_PRODUCT_ID")),
 		LocalBrokerAudience:        strings.TrimSpace(os.Getenv("LOCAL_BROKER_AUDIENCE")),
 		LocalBrokerEntitlements:    splitCSV(os.Getenv("LOCAL_BROKER_REQUIRED_ENTITLEMENTS")),
+		LocalBrokerPolicies:        localBrokerPolicies,
 		LocalBrokerTTL:             localBrokerTTL,
 	}
 	if err := cfg.Validate(); err != nil {
@@ -152,19 +169,33 @@ func (c Config) Validate() error {
 		return errors.New("session TTL configuration is invalid")
 	}
 	if c.LocalBrokerEnabled {
-		if !providerTokenPattern.MatchString(c.LocalBrokerProductID) ||
-			!providerTokenPattern.MatchString(c.LocalBrokerAudience) {
-			return errors.New("LOCAL_BROKER_PRODUCT_ID and LOCAL_BROKER_AUDIENCE must be configured tokens")
-		}
 		if c.LocalBrokerTTL <= 0 || c.LocalBrokerTTL > 24*time.Hour {
 			return errors.New("LOCAL_BROKER_TTL must be greater than zero and at most 24h")
 		}
-		if len(c.LocalBrokerEntitlements) == 0 {
-			return errors.New("LOCAL_BROKER_REQUIRED_ENTITLEMENTS must not be empty")
+		policies := c.EffectiveLocalBrokerPolicies()
+		if len(policies) == 0 {
+			return errors.New("LOCAL_BROKER_POLICIES or the legacy single-product policy must be configured")
 		}
-		for _, required := range c.LocalBrokerEntitlements {
-			if !contains(c.DefaultEntitlements, required) {
-				return fmt.Errorf("local broker entitlement %q is absent from DEFAULT_ENTITLEMENTS", required)
+		seen := make(map[string]struct{}, len(policies))
+		for _, policy := range policies {
+			if !providerTokenPattern.MatchString(policy.ProductID) ||
+				!providerTokenPattern.MatchString(policy.Audience) {
+				return errors.New("local broker productId and audience must be configured tokens")
+			}
+			if _, duplicate := seen[policy.ProductID]; duplicate {
+				return fmt.Errorf("duplicate local broker product policy %q", policy.ProductID)
+			}
+			seen[policy.ProductID] = struct{}{}
+			if len(policy.RequiredEntitlements) == 0 {
+				return fmt.Errorf("local broker product %q must require at least one entitlement", policy.ProductID)
+			}
+			for _, required := range policy.RequiredEntitlements {
+				if !entitlementTokenPattern.MatchString(required) {
+					return fmt.Errorf("invalid local broker entitlement %q", required)
+				}
+				if !contains(c.DefaultEntitlements, required) {
+					return fmt.Errorf("local broker entitlement %q is absent from DEFAULT_ENTITLEMENTS", required)
+				}
 			}
 		}
 	}
@@ -242,6 +273,45 @@ func (c Config) Validate() error {
 		return errors.New("IAM_ROLE_COMMAND_PREFIX must end with a colon")
 	}
 	return nil
+}
+
+func (c Config) EffectiveLocalBrokerPolicies() []LocalBrokerProductPolicy {
+	policies := c.LocalBrokerPolicies
+	if len(policies) == 0 && (c.LocalBrokerProductID != "" || c.LocalBrokerAudience != "" || len(c.LocalBrokerEntitlements) > 0) {
+		policies = []LocalBrokerProductPolicy{{
+			ProductID:            c.LocalBrokerProductID,
+			Audience:             c.LocalBrokerAudience,
+			RequiredEntitlements: c.LocalBrokerEntitlements,
+		}}
+	}
+	result := make([]LocalBrokerProductPolicy, 0, len(policies))
+	for _, policy := range policies {
+		policy.ProductID = strings.TrimSpace(policy.ProductID)
+		policy.Audience = strings.TrimSpace(policy.Audience)
+		policy.RequiredEntitlements = append([]string(nil), policy.RequiredEntitlements...)
+		for index := range policy.RequiredEntitlements {
+			policy.RequiredEntitlements[index] = strings.TrimSpace(policy.RequiredEntitlements[index])
+		}
+		result = append(result, policy)
+	}
+	return result
+}
+
+func parseLocalBrokerPolicies(raw string) ([]LocalBrokerProductPolicy, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	var policies []LocalBrokerProductPolicy
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&policies); err != nil {
+		return nil, fmt.Errorf("parse LOCAL_BROKER_POLICIES: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, errors.New("parse LOCAL_BROKER_POLICIES: one JSON array is required")
+	}
+	return policies, nil
 }
 
 func contains(values []string, expected string) bool {

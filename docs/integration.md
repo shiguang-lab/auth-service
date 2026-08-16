@@ -247,7 +247,8 @@ POST /v1/identity/users/resolve            Authorization: Bearer <POINTS_IDENTIT
 
 需要 localhost API 使用真实生产账号、但不把凭据或共享 cookie 交给浏览器时，
 可由平台为指定产品开启 Local Broker。该能力只接受真实账号密码，不接受 subject，
-并在服务端固定 product、audience、required entitlement：
+并在服务端白名单中固定 product、audience、required entitlement。客户端只能选择
+白名单中的 productId，Broker 创建后不能切换产品：
 
 ```text
 localhost Node proxy --账号密码--> POST /api/auth/local-broker
@@ -261,9 +262,7 @@ localhost browser --> Node proxy --X-SG-Identity--> localhost product API
 
 ```dotenv
 LOCAL_BROKER_ENABLED=true
-LOCAL_BROKER_PRODUCT_ID=asset-hub
-LOCAL_BROKER_AUDIENCE=asset-hub-api
-LOCAL_BROKER_REQUIRED_ENTITLEMENTS=asset-hub:access
+LOCAL_BROKER_POLICIES=[{"productId":"asset-hub","audience":"asset-hub-api","requiredEntitlements":["asset-hub:access"]},{"productId":"opc","audience":"superagents-bff","requiredEntitlements":["superagents:access"]}]
 LOCAL_BROKER_TTL=12h
 DEFAULT_ENTITLEMENTS=superagents:access,asset-hub:access
 ```

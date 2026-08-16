@@ -556,6 +556,68 @@ func TestPasswordCreatesOpaquePlatformSessionWithoutOIDCCallback(t *testing.T) {
 	}
 }
 
+func TestCreateLocalBrokerStoresBrokerOnlyCredential(t *testing.T) {
+	service, _, upstream, sessions := newDirectLoginTestService()
+	upstream.passwordSession = zitadel.Session{
+		ID:          "zitadel-broker-session",
+		Token:       "zitadel-broker-token",
+		Subject:     "zitadel-user",
+		LoginName:   "alice@example.com",
+		DisplayName: "Alice",
+	}
+	upstream.profileUser = zitadel.User{
+		ID: "zitadel-user", LoginName: "alice@example.com", DisplayName: "Alice", Email: "alice@example.com",
+	}
+
+	brokerToken, value, err := service.CreateLocalBroker(
+		context.Background(),
+		"127.0.0.1",
+		"alice@example.com",
+		"correct horse",
+		12*time.Hour,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if brokerToken == "" || value.CredentialKind != session.CredentialKindLocalBroker ||
+		value.Subject != "zitadel-user" || value.CredentialExpiresAt.IsZero() {
+		t.Fatalf("broker token=%q session=%#v", brokerToken, value)
+	}
+	stored, err := sessions.Get(context.Background(), brokerToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.UpstreamSessionToken != "zitadel-broker-token" || stored.Email != "alice@example.com" {
+		t.Fatalf("stored broker=%#v", stored)
+	}
+	resolved, err := service.ResolveLocalBroker(context.Background(), brokerToken)
+	if err != nil || resolved.Subject != "zitadel-user" {
+		t.Fatalf("resolved=%#v err=%v", resolved, err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/auth/session", nil)
+	request.AddCookie(&http.Cookie{Name: "__Secure-sg_session", Value: brokerToken})
+	response := httptest.NewRecorder()
+	service.Session(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("broker accepted as browser session: status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestCreateLocalBrokerRejectsInvalidCredentialsWithoutPersisting(t *testing.T) {
+	service, _, upstream, sessions := newDirectLoginTestService()
+	upstream.err = &zitadel.APIError{StatusCode: http.StatusUnauthorized}
+
+	brokerToken, _, err := service.CreateLocalBroker(
+		context.Background(), "127.0.0.1", "alice@example.com", "wrong", time.Hour,
+	)
+	if !errors.Is(err, ErrBrokerInvalidCredentials) || brokerToken != "" {
+		t.Fatalf("token=%q err=%v", brokerToken, err)
+	}
+	if _, err := sessions.Get(context.Background(), ""); !errors.Is(err, session.ErrNotFound) {
+		t.Fatalf("unexpected stored broker: %v", err)
+	}
+}
+
 func TestSendEmailCodeStartsZITADELOTPChallenge(t *testing.T) {
 	service, transactions, upstream, _ := newDirectLoginTestService()
 	transactions.attempts["transaction"] = loginAttempt{

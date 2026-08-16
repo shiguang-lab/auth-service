@@ -5,10 +5,12 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -16,6 +18,7 @@ import (
 	"github.com/shiguanglab/auth-service/internal/identity"
 	loginservice "github.com/shiguanglab/auth-service/internal/login"
 	orgservice "github.com/shiguanglab/auth-service/internal/orgs"
+	"github.com/shiguanglab/auth-service/internal/session"
 )
 
 const (
@@ -33,12 +36,28 @@ type Server struct {
 	logger       *slog.Logger
 	login        *loginservice.Service
 	orgs         *orgservice.Service
+	localBroker  *LocalBrokerPolicy
+}
+
+type LocalBrokerPolicy struct {
+	PublicOrigin         string
+	ProductID            string
+	Audience             string
+	RequiredEntitlements []string
+	BrokerTTL            time.Duration
+	IdentityTTL          time.Duration
 }
 
 // WithOrganizations attaches the organization domain service. Routes are only
 // mounted when both the login service and this service are configured.
 func (s *Server) WithOrganizations(orgs *orgservice.Service) *Server {
 	s.orgs = orgs
+	return s
+}
+
+func (s *Server) WithLocalBroker(policy LocalBrokerPolicy) *Server {
+	policy.RequiredEntitlements = append([]string(nil), policy.RequiredEntitlements...)
+	s.localBroker = &policy
 	return s
 }
 
@@ -103,6 +122,10 @@ func (s *Server) Handler() http.Handler {
 			auth.Patch("/api/account/profile", s.login.UpdateProfile)
 			auth.Post("/api/account/avatar", s.login.UploadAvatar)
 			auth.Post("/api/auth/logout", s.login.Logout)
+			if s.localBroker != nil {
+				auth.Post("/api/auth/local-broker", s.handleLocalBrokerLogin)
+				auth.Post("/api/auth/local-broker/refresh", s.handleLocalBrokerRefresh)
+			}
 			if s.orgs != nil {
 				auth.Post("/api/auth/context", s.orgs.SwitchContextHandler)
 				auth.Post("/api/account/orgs", s.orgs.CreateOrganizationHandler)
@@ -122,6 +145,120 @@ func (s *Server) Handler() http.Handler {
 		})
 	}
 	return router
+}
+
+func (s *Server) handleLocalBrokerLogin(response http.ResponseWriter, request *http.Request) {
+	if !s.validLocalBrokerOrigin(request) {
+		writeJSON(response, http.StatusForbidden, map[string]string{"error": "invalid_origin"})
+		return
+	}
+	var input struct {
+		LoginName string `json:"loginName"`
+		Password  string `json:"password"`
+	}
+	if err := decodeBrokerJSON(response, request, &input); err != nil {
+		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	brokerToken, value, err := s.login.CreateLocalBroker(
+		request.Context(),
+		brokerClientKey(request),
+		input.LoginName,
+		input.Password,
+		s.localBroker.BrokerTTL,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, loginservice.ErrBrokerInvalidCredentials):
+			writeJSON(response, http.StatusUnauthorized, map[string]string{"error": "invalid_credentials"})
+		case errors.Is(err, loginservice.ErrBrokerRateLimited):
+			writeJSON(response, http.StatusTooManyRequests, map[string]string{"error": "try_again_later"})
+		default:
+			s.logger.Error("create local broker", "error", err)
+			writeJSON(response, http.StatusServiceUnavailable, map[string]string{"error": "broker_unavailable"})
+		}
+		return
+	}
+	s.writeLocalBrokerResponse(response, request, brokerToken, value)
+}
+
+func (s *Server) handleLocalBrokerRefresh(response http.ResponseWriter, request *http.Request) {
+	if !s.validLocalBrokerOrigin(request) {
+		writeJSON(response, http.StatusForbidden, map[string]string{"error": "invalid_origin"})
+		return
+	}
+	brokerToken := bearerToken(request.Header.Get("Authorization"))
+	value, err := s.login.ResolveLocalBroker(request.Context(), brokerToken)
+	if err != nil {
+		writeJSON(response, http.StatusUnauthorized, map[string]string{"error": "broker_invalid"})
+		return
+	}
+	s.writeLocalBrokerResponse(response, request, brokerToken, value)
+}
+
+func (s *Server) writeLocalBrokerResponse(
+	response http.ResponseWriter,
+	request *http.Request,
+	brokerToken string,
+	value session.Session,
+) {
+	policy := s.localBroker
+	decision := s.decision.DecideBroker(request.Context(), brokerToken, authorize.Request{
+		ProductID:            policy.ProductID,
+		Audience:             policy.Audience,
+		RequiredEntitlements: policy.RequiredEntitlements,
+	})
+	if !decision.Allow {
+		writeJSON(response, decision.Status, map[string]string{"error": decision.Reason})
+		return
+	}
+	var organization any
+	if value.OrganizationID != "" {
+		organization = map[string]string{"id": value.OrganizationID, "name": value.OrganizationName}
+	}
+	now := time.Now().UTC()
+	writeJSON(response, http.StatusOK, map[string]any{
+		"brokerToken":       brokerToken,
+		"brokerExpiresAt":   value.CredentialExpiresAt.Format(time.RFC3339Nano),
+		"identityToken":     decision.IdentityToken,
+		"identityExpiresAt": now.Add(policy.IdentityTTL).Format(time.RFC3339Nano),
+		"session": map[string]any{
+			"authenticated":     true,
+			"subject":           value.Subject,
+			"displayName":       value.DisplayName,
+			"email":             value.Email,
+			"preferredUsername": value.PreferredUsername,
+			"entitlements":      value.Entitlements,
+			"organization":      organization,
+			"roles":             value.Roles,
+			"platformRoles":     value.PlatformRoles,
+		},
+	})
+}
+
+func (s *Server) validLocalBrokerOrigin(request *http.Request) bool {
+	return s.localBroker != nil && request.Header.Get("Origin") == s.localBroker.PublicOrigin
+}
+
+func decodeBrokerJSON(response http.ResponseWriter, request *http.Request, value any) error {
+	decoder := json.NewDecoder(http.MaxBytesReader(response, request.Body, 4<<10))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(value)
+}
+
+func brokerClientKey(request *http.Request) string {
+	if forwarded := strings.TrimSpace(strings.Split(request.Header.Get("X-Forwarded-For"), ",")[0]); forwarded != "" {
+		return forwarded
+	}
+	return request.RemoteAddr
+}
+
+func bearerToken(value string) string {
+	scheme, token, ok := strings.Cut(strings.TrimSpace(value), " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return ""
+	}
+	return strings.TrimSpace(token)
 }
 
 func (s *Server) handleForwardAuth(response http.ResponseWriter, request *http.Request) {

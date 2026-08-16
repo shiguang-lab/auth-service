@@ -9,13 +9,15 @@ import (
 
 var ErrNotFound = errors.New("session not found")
 
+const CredentialKindLocalBroker = "local_broker"
+
 type Session struct {
-	AssertionSessionID    string    `json:"assertion_session_id"`
-	Subject               string    `json:"subject"`
-	OrganizationID        string    `json:"organization_id,omitempty"`
-	OrganizationName      string    `json:"organization_name,omitempty"`
+	AssertionSessionID string `json:"assertion_session_id"`
+	Subject            string `json:"subject"`
+	OrganizationID     string `json:"organization_id,omitempty"`
+	OrganizationName   string `json:"organization_name,omitempty"`
 	// Roles of the active business-organization context (empty when personal).
-	Roles                 []string  `json:"roles,omitempty"`
+	Roles []string `json:"roles,omitempty"`
 	// PlatformRoles are context-independent roles granted on the platform
 	// project itself (for example opc:system-admin). They survive context
 	// switches and are merged into every assertion.
@@ -31,6 +33,8 @@ type Session struct {
 	CreatedAt             time.Time `json:"created_at"`
 	LastSeenAt            time.Time `json:"last_seen_at"`
 	RevokedAt             time.Time `json:"revoked_at,omitempty"`
+	CredentialKind        string    `json:"credential_kind,omitempty"`
+	CredentialExpiresAt   time.Time `json:"credential_expires_at,omitempty"`
 }
 
 type Store interface {

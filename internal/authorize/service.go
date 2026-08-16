@@ -71,12 +71,31 @@ func (s *Service) Decide(ctx context.Context, request Request) Response {
 		}
 		return Response{Allow: false, Status: 401, Reason: reason}
 	}
-	value, err := s.store.Get(ctx, sessionID)
+	return s.decideCredential(ctx, sessionID, request, false)
+}
+
+// DecideBroker validates a server-held local development broker and issues the
+// same short-lived, audience-bound identity assertion used by access-gateway.
+func (s *Service) DecideBroker(ctx context.Context, brokerToken string, request Request) Response {
+	if brokerToken == "" {
+		return Response{Allow: false, Status: 401, Reason: "broker_missing"}
+	}
+	return s.decideCredential(ctx, brokerToken, request, true)
+}
+
+func (s *Service) decideCredential(ctx context.Context, credential string, request Request, broker bool) Response {
+	if request.Audience == "" || request.ProductID == "" {
+		return Response{Allow: false, Status: 403, Reason: "invalid_route_identity"}
+	}
+	value, err := s.store.Get(ctx, credential)
 	if err != nil {
 		if errors.Is(err, session.ErrNotFound) {
-			return Response{Allow: false, Status: 401, Reason: "session_invalid"}
+			return Response{Allow: false, Status: 401, Reason: credentialReason(broker, "invalid")}
 		}
 		return Response{Allow: false, Status: 503, Reason: "session_store_unavailable"}
+	}
+	if broker != (value.CredentialKind == session.CredentialKindLocalBroker) {
+		return Response{Allow: false, Status: 401, Reason: credentialReason(broker, "invalid")}
 	}
 	now := s.now()
 	if !value.RevokedAt.IsZero() {
@@ -90,7 +109,10 @@ func (s *Service) Decide(ctx context.Context, request Request) Response {
 		return Response{Allow: false, Status: 401, Reason: "session_invalid"}
 	}
 	if now.Sub(value.LastSeenAt) > s.idleTTL || now.Sub(value.CreatedAt) > s.absoluteTTL {
-		return Response{Allow: false, Status: 401, Reason: "session_expired"}
+		return Response{Allow: false, Status: 401, Reason: credentialReason(broker, "expired")}
+	}
+	if !value.CredentialExpiresAt.IsZero() && !now.Before(value.CredentialExpiresAt) {
+		return Response{Allow: false, Status: 401, Reason: credentialReason(broker, "expired")}
 	}
 	if !containsAll(value.Entitlements, request.RequiredEntitlements) {
 		return Response{Allow: false, Status: 403, Reason: "missing_entitlement"}
@@ -110,6 +132,13 @@ func (s *Service) Decide(ctx context.Context, request Request) Response {
 		return Response{Allow: false, Status: 503, Reason: "identity_issuer_unavailable"}
 	}
 	return Response{Allow: true, Status: 200, IdentityToken: token}
+}
+
+func credentialReason(broker bool, suffix string) string {
+	if broker {
+		return "broker_" + suffix
+	}
+	return "session_" + suffix
 }
 
 func cookieValue(raw, name string) (string, int) {

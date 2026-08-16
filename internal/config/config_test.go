@@ -108,3 +108,30 @@ func TestFeishuProviderRequiresAppID(t *testing.T) {
 		t.Fatalf("validate Feishu provider config: %v", err)
 	}
 }
+
+func TestLocalBrokerRequiresFixedProductPolicyAndDefaultEntitlement(t *testing.T) {
+	cfg := Config{
+		Environment:             "development",
+		GatewayToken:            strings.Repeat("x", 32),
+		SessionBackend:          "memory",
+		SessionCookieName:       "__Secure-sg_session",
+		IdentityIssuer:          "https://shiguanglab.com",
+		SigningKeyID:            "key-1",
+		IdentityTokenTTL:        time.Minute,
+		IdleTTL:                 time.Hour,
+		AbsoluteTTL:             24 * time.Hour,
+		DefaultEntitlements:     []string{"superagents:access"},
+		LocalBrokerEnabled:      true,
+		LocalBrokerProductID:    "asset-hub",
+		LocalBrokerAudience:     "asset-hub-api",
+		LocalBrokerEntitlements: []string{"asset-hub:access"},
+		LocalBrokerTTL:          12 * time.Hour,
+	}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "absent from DEFAULT_ENTITLEMENTS") {
+		t.Fatalf("expected missing entitlement error, got %v", err)
+	}
+	cfg.DefaultEntitlements = append(cfg.DefaultEntitlements, "asset-hub:access")
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate local broker config: %v", err)
+	}
+}

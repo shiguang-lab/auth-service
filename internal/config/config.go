@@ -51,6 +51,11 @@ type Config struct {
 	IdentityTokenTTL           time.Duration
 	IdleTTL                    time.Duration
 	AbsoluteTTL                time.Duration
+	LocalBrokerEnabled         bool
+	LocalBrokerProductID       string
+	LocalBrokerAudience        string
+	LocalBrokerEntitlements    []string
+	LocalBrokerTTL             time.Duration
 }
 
 func Load() (Config, error) {
@@ -67,6 +72,10 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	iamRoleCommandTTL, err := durationOr("IAM_ROLE_COMMAND_TTL", 30*24*time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
+	localBrokerTTL, err := durationOr("LOCAL_BROKER_TTL", 12*time.Hour)
 	if err != nil {
 		return Config{}, err
 	}
@@ -117,6 +126,11 @@ func Load() (Config, error) {
 		IdentityTokenTTL:           identityTokenTTL,
 		IdleTTL:                    idleTTL,
 		AbsoluteTTL:                absoluteTTL,
+		LocalBrokerEnabled:         strings.EqualFold(strings.TrimSpace(os.Getenv("LOCAL_BROKER_ENABLED")), "true"),
+		LocalBrokerProductID:       strings.TrimSpace(os.Getenv("LOCAL_BROKER_PRODUCT_ID")),
+		LocalBrokerAudience:        strings.TrimSpace(os.Getenv("LOCAL_BROKER_AUDIENCE")),
+		LocalBrokerEntitlements:    splitCSV(os.Getenv("LOCAL_BROKER_REQUIRED_ENTITLEMENTS")),
+		LocalBrokerTTL:             localBrokerTTL,
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -136,6 +150,23 @@ func (c Config) Validate() error {
 	}
 	if c.IdleTTL <= 0 || c.AbsoluteTTL <= 0 || c.IdleTTL > c.AbsoluteTTL {
 		return errors.New("session TTL configuration is invalid")
+	}
+	if c.LocalBrokerEnabled {
+		if !providerTokenPattern.MatchString(c.LocalBrokerProductID) ||
+			!providerTokenPattern.MatchString(c.LocalBrokerAudience) {
+			return errors.New("LOCAL_BROKER_PRODUCT_ID and LOCAL_BROKER_AUDIENCE must be configured tokens")
+		}
+		if c.LocalBrokerTTL <= 0 || c.LocalBrokerTTL > 24*time.Hour {
+			return errors.New("LOCAL_BROKER_TTL must be greater than zero and at most 24h")
+		}
+		if len(c.LocalBrokerEntitlements) == 0 {
+			return errors.New("LOCAL_BROKER_REQUIRED_ENTITLEMENTS must not be empty")
+		}
+		for _, required := range c.LocalBrokerEntitlements {
+			if !contains(c.DefaultEntitlements, required) {
+				return fmt.Errorf("local broker entitlement %q is absent from DEFAULT_ENTITLEMENTS", required)
+			}
+		}
 	}
 	switch c.SessionBackend {
 	case "memory":
@@ -211,6 +242,15 @@ func (c Config) Validate() error {
 		return errors.New("IAM_ROLE_COMMAND_PREFIX must end with a colon")
 	}
 	return nil
+}
+
+func contains(values []string, expected string) bool {
+	for _, value := range values {
+		if value == expected {
+			return true
+		}
+	}
+	return false
 }
 
 func validOrigin(origin, environment string) bool {

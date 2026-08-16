@@ -9,6 +9,8 @@ import (
 
 var ErrNotFound = errors.New("session not found")
 
+const CredentialKindLocalBroker = "local_broker"
+
 type Session struct {
 	AssertionSessionID string `json:"assertion_session_id"`
 	Subject            string `json:"subject"`
@@ -32,6 +34,8 @@ type Session struct {
 	CreatedAt                time.Time `json:"created_at"`
 	LastSeenAt               time.Time `json:"last_seen_at"`
 	RevokedAt                time.Time `json:"revoked_at,omitempty"`
+	CredentialKind           string    `json:"credential_kind,omitempty"`
+	CredentialExpiresAt      time.Time `json:"credential_expires_at,omitempty"`
 }
 
 type Store interface {

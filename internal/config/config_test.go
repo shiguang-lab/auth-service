@@ -225,3 +225,22 @@ func TestLocalIdentityFixtureValidation(t *testing.T) {
 		t.Fatalf("remote fixture origin error = %v", err)
 	}
 }
+
+func TestLocalBrokerRequiresFixedProductPolicyAndDefaultEntitlement(t *testing.T) {
+	cfg := Config{
+		Environment: "development", GatewayToken: strings.Repeat("x", 32), SessionBackend: "memory",
+		SessionCookieName: "session", IdentityIssuer: "https://auth.shiguanglab.com", SigningKeyID: "key",
+		IdentityTokenTTL: time.Minute, IdleTTL: time.Hour, AbsoluteTTL: 24 * time.Hour,
+		IAMRoleAdminOrigins: []string{"http://127.0.0.1:3002"},
+		DefaultEntitlements: []string{"platform:access"}, LocalBrokerEnabled: true,
+		LocalBrokerProductID: "asset-hub", LocalBrokerAudience: "asset-hub-api",
+		LocalBrokerEntitlements: []string{"asset-hub:access"}, LocalBrokerTTL: 12 * time.Hour,
+	}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "absent from DEFAULT_ENTITLEMENTS") {
+		t.Fatalf("expected missing entitlement error, got %v", err)
+	}
+	cfg.DefaultEntitlements = append(cfg.DefaultEntitlements, "asset-hub:access")
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate local broker config: %v", err)
+	}
+}

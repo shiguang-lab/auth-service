@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -20,6 +21,7 @@ import (
 	loginservice "github.com/shiguanglab/auth-service/internal/login"
 	orgservice "github.com/shiguanglab/auth-service/internal/orgs"
 	"github.com/shiguanglab/auth-service/internal/platformroleadmin"
+	"github.com/shiguanglab/auth-service/internal/session"
 )
 
 const (
@@ -40,10 +42,26 @@ type Server struct {
 	orgs          *orgservice.Service
 	roleAdmin     *platformroleadmin.Service
 	localIdentity *localidentity.Service
+	localBroker   *LocalBrokerPolicy
+}
+
+type LocalBrokerPolicy struct {
+	PublicOrigin         string
+	ProductID            string
+	Audience             string
+	RequiredEntitlements []string
+	BrokerTTL            time.Duration
+	IdentityTTL          time.Duration
 }
 
 func (s *Server) WithLocalIdentity(service *localidentity.Service) *Server {
 	s.localIdentity = service
+	return s
+}
+
+func (s *Server) WithLocalBroker(policy LocalBrokerPolicy) *Server {
+	policy.RequiredEntitlements = append([]string(nil), policy.RequiredEntitlements...)
+	s.localBroker = &policy
 	return s
 }
 
@@ -133,6 +151,10 @@ func (s *Server) Handler() http.Handler {
 			auth.Get("/api/auth/idp-links", s.login.ListIDPLinks)
 			auth.Get("/api/auth/session", s.login.Session)
 			auth.Post("/api/auth/logout", s.login.Logout)
+			if s.localBroker != nil {
+				auth.Post("/api/auth/local-broker", s.handleLocalBrokerLogin)
+				auth.Post("/api/auth/local-broker/refresh", s.handleLocalBrokerRefresh)
+			}
 			if s.roleAdmin != nil {
 				auth.Post("/api/auth/iam/points-role-assignments/search", s.roleAdmin.SearchHandler)
 				auth.Post("/api/auth/iam/points-role-assignments/resolve", s.roleAdmin.ResolveHandler)
@@ -162,6 +184,126 @@ func (s *Server) Handler() http.Handler {
 		})
 	}
 	return router
+}
+
+func (s *Server) handleLocalBrokerLogin(response http.ResponseWriter, request *http.Request) {
+	if !s.validLocalBrokerOrigin(request) {
+		writeJSON(response, http.StatusForbidden, map[string]string{"error": "invalid_origin"})
+		return
+	}
+	var input struct {
+		LoginName string `json:"loginName"`
+		Password  string `json:"password"`
+	}
+	if err := decodeBrokerJSON(response, request, &input); err != nil {
+		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	brokerToken, value, err := s.login.CreateLocalBroker(
+		request.Context(),
+		brokerClientKey(request),
+		input.LoginName,
+		input.Password,
+		s.localBroker.BrokerTTL,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, loginservice.ErrBrokerInvalidCredentials):
+			writeJSON(response, http.StatusUnauthorized, map[string]string{"error": "invalid_credentials"})
+		case errors.Is(err, loginservice.ErrBrokerRateLimited):
+			writeJSON(response, http.StatusTooManyRequests, map[string]string{"error": "try_again_later"})
+		default:
+			s.logger.Error("create local broker", "error", err)
+			writeJSON(response, http.StatusServiceUnavailable, map[string]string{"error": "broker_unavailable"})
+		}
+		return
+	}
+	s.writeLocalBrokerResponse(response, request, brokerToken, value)
+}
+
+func (s *Server) handleLocalBrokerRefresh(response http.ResponseWriter, request *http.Request) {
+	if !s.validLocalBrokerOrigin(request) {
+		writeJSON(response, http.StatusForbidden, map[string]string{"error": "invalid_origin"})
+		return
+	}
+	brokerToken := bearerToken(request.Header.Get("Authorization"))
+	value, err := s.login.ResolveLocalBroker(request.Context(), brokerToken)
+	if err != nil {
+		writeJSON(response, http.StatusUnauthorized, map[string]string{"error": "broker_invalid"})
+		return
+	}
+	s.writeLocalBrokerResponse(response, request, brokerToken, value)
+}
+
+func (s *Server) writeLocalBrokerResponse(
+	response http.ResponseWriter,
+	request *http.Request,
+	brokerToken string,
+	value session.Session,
+) {
+	policy := s.localBroker
+	decision := s.decision.DecideBroker(request.Context(), brokerToken, authorize.Request{
+		ProductID:            policy.ProductID,
+		Audience:             policy.Audience,
+		RequiredEntitlements: policy.RequiredEntitlements,
+	})
+	if !decision.Allow {
+		writeJSON(response, decision.Status, map[string]string{"error": decision.Reason})
+		return
+	}
+	var organization any
+	if value.OrganizationID != "" {
+		organization = map[string]string{"id": value.OrganizationID, "name": value.OrganizationName}
+	}
+	now := time.Now().UTC()
+	writeJSON(response, http.StatusOK, map[string]any{
+		"brokerToken":       brokerToken,
+		"brokerExpiresAt":   value.CredentialExpiresAt.Format(time.RFC3339Nano),
+		"identityToken":     decision.IdentityToken,
+		"identityExpiresAt": now.Add(policy.IdentityTTL).Format(time.RFC3339Nano),
+		"session": map[string]any{
+			"authenticated":     true,
+			"subject":           value.Subject,
+			"displayName":       value.DisplayName,
+			"email":             value.Email,
+			"preferredUsername": value.PreferredUsername,
+			"entitlements":      value.Entitlements,
+			"organization":      organization,
+			"roles":             value.Roles,
+			"platformRoles":     value.PlatformRoles,
+		},
+	})
+}
+
+func (s *Server) validLocalBrokerOrigin(request *http.Request) bool {
+	return s.localBroker != nil && request.Header.Get("Origin") == s.localBroker.PublicOrigin
+}
+
+func decodeBrokerJSON(response http.ResponseWriter, request *http.Request, value any) error {
+	decoder := json.NewDecoder(http.MaxBytesReader(response, request.Body, 4<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("one JSON value is required")
+	}
+	return nil
+}
+
+func brokerClientKey(request *http.Request) string {
+	if forwarded := strings.TrimSpace(strings.Split(request.Header.Get("X-Forwarded-For"), ",")[0]); forwarded != "" {
+		return forwarded
+	}
+	return request.RemoteAddr
+}
+
+func bearerToken(value string) string {
+	scheme, token, ok := strings.Cut(strings.TrimSpace(value), " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return ""
+	}
+	return strings.TrimSpace(token)
 }
 
 func (s *Server) handleForwardAuth(response http.ResponseWriter, request *http.Request) {

@@ -233,6 +233,8 @@ POST /v1/identity/users/resolve            Authorization: Bearer <POINTS_IDENTIT
 
 ## 7. 本地开发
 
+### 7.1 固定开发身份
+
 推荐"开发身份注入"模式(参考 superagents):本地不起网关/auth-service,
 产品用与生产完全相同的验证代码路径,仅在断言缺失时注入固定身份:
 
@@ -240,6 +242,35 @@ POST /v1/identity/users/resolve            Authorization: Bearer <POINTS_IDENTIT
 - **生产环境启动时若发现开关打开必须直接抛错拒绝启动**;
 - 需要联调真实登录时,再本地起 auth-service(memory session)+ gateway
   (`make run`,见各仓库 README)。
+
+### 7.2 生产账号 Local Broker
+
+需要 localhost API 使用真实生产账号、但不把凭据或共享 cookie 交给浏览器时，
+可由平台为指定产品开启 Local Broker。该能力只接受真实账号密码，不接受 subject，
+并在服务端固定 product、audience、required entitlement：
+
+```text
+localhost Node proxy --账号密码--> POST /api/auth/local-broker
+                     <--opaque broker + 1m identity assertion--
+localhost Node proxy --Broker--> POST /api/auth/local-broker/refresh
+                     <--新的 audience-bound identity assertion--
+localhost browser --> Node proxy --X-SG-Identity--> localhost product API
+```
+
+生产配置示例：
+
+```dotenv
+LOCAL_BROKER_ENABLED=true
+LOCAL_BROKER_PRODUCT_ID=asset-hub
+LOCAL_BROKER_AUDIENCE=asset-hub-api
+LOCAL_BROKER_REQUIRED_ENTITLEMENTS=asset-hub:access
+LOCAL_BROKER_TTL=12h
+DEFAULT_ENTITLEMENTS=superagents:access,asset-hub:access
+```
+
+Broker 和密码只能留在 localhost Node 进程内，不得返回浏览器、写磁盘或输出日志。
+修改账号通过本地 env 后重启，不提供账号切换 UI。普通浏览器 session 不能调用
+Broker refresh，Broker 也不能作为 `.shiguanglab.com` 共享 cookie 使用。
 
 ---
 

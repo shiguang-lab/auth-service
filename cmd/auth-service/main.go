@@ -160,6 +160,16 @@ func main() {
 		return nil
 	}
 	api := httpapi.NewServer(decision, signer, cfg.GatewayToken, readiness, logger, login)
+	if cfg.LocalBrokerEnabled {
+		api.WithLocalBroker(httpapi.LocalBrokerPolicy{
+			PublicOrigin:         cfg.PublicOrigin,
+			ProductID:            cfg.LocalBrokerProductID,
+			Audience:             cfg.LocalBrokerAudience,
+			RequiredEntitlements: cfg.LocalBrokerEntitlements,
+			BrokerTTL:            cfg.LocalBrokerTTL,
+			IdentityTTL:          cfg.IdentityTokenTTL,
+		})
+	}
 	if localFixture != nil {
 		api.WithLocalIdentity(localFixture)
 		api.WithPlatformRoleAdmin(platformroleadmin.NewService(localFixture, localFixture, localExecutor, localFixture, cfg.IAMRoleAdminOrigins, logger))

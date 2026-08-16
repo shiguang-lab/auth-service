@@ -32,8 +32,10 @@ const csrfCookieName = "__Host-sg_login_csrf"
 const zitadelSelectIDPScope = "urn:zitadel:iam:org:idp:id:"
 
 var (
-	usernamePattern = regexp.MustCompile(`^[a-zA-Z0-9_]{3,20}$`)
-	emailPattern    = regexp.MustCompile(`^[^\s@]+@[^\s@]+\.[^\s@]+$`)
+	usernamePattern             = regexp.MustCompile(`^[a-zA-Z0-9_]{3,20}$`)
+	emailPattern                = regexp.MustCompile(`^[^\s@]+@[^\s@]+\.[^\s@]+$`)
+	ErrBrokerInvalidCredentials = errors.New("invalid broker credentials")
+	ErrBrokerRateLimited        = errors.New("broker login rate limited")
 )
 
 type Service struct {
@@ -529,6 +531,91 @@ func (s *Service) Password(response http.ResponseWriter, request *http.Request) 
 	writeJSON(response, http.StatusOK, map[string]string{"redirect": attempt.ReturnTo})
 }
 
+// CreateLocalBroker authenticates a real ZITADEL account and stores a
+// broker-only opaque credential. It does not issue a browser cookie.
+func (s *Service) CreateLocalBroker(
+	ctx context.Context,
+	clientKey string,
+	loginName string,
+	password string,
+	ttl time.Duration,
+) (string, session.Session, error) {
+	loginName = strings.TrimSpace(loginName)
+	if loginName == "" || password == "" || len(loginName) > 320 || len(password) > 1024 {
+		return "", session.Session{}, ErrBrokerInvalidCredentials
+	}
+	allowed, err := s.transactions.allowAttempt(
+		ctx,
+		"local-broker|"+clientKey+"|"+strings.ToLower(loginName),
+	)
+	if err != nil {
+		return "", session.Session{}, err
+	}
+	if !allowed {
+		return "", session.Session{}, ErrBrokerRateLimited
+	}
+
+	upstreamSession, err := s.zitadel.PasswordSession(ctx, loginName, password)
+	if err != nil {
+		s.logger.Warn("ZITADEL local broker authentication failed")
+		return "", session.Session{}, ErrBrokerInvalidCredentials
+	}
+	now := time.Now().UTC()
+	brokerToken, err := randomValue(32)
+	if err != nil {
+		_ = s.zitadel.DeleteSession(ctx, upstreamSession.ID, upstreamSession.Token)
+		return "", session.Session{}, err
+	}
+	value := session.Session{
+		AssertionSessionID:       brokerToken,
+		Subject:                  upstreamSession.Subject,
+		Entitlements:             append([]string(nil), s.cfg.DefaultEntitlements...),
+		PlatformRoles:            s.platformRoles(ctx, upstreamSession.Subject),
+		PlatformRolesRefreshedAt: now,
+		AuthenticationTime:       now,
+		AuthenticationMethods:    []string{"pwd"},
+		DisplayName:              firstNonEmpty(upstreamSession.DisplayName, upstreamSession.LoginName),
+		PreferredUsername:        upstreamSession.LoginName,
+		UpstreamSessionID:        upstreamSession.ID,
+		UpstreamSessionToken:     upstreamSession.Token,
+		CreatedAt:                now,
+		LastSeenAt:               now,
+		CredentialKind:           session.CredentialKindLocalBroker,
+		CredentialExpiresAt:      now.Add(ttl),
+	}
+	if value.Subject == "" {
+		_ = s.zitadel.DeleteSession(ctx, upstreamSession.ID, upstreamSession.Token)
+		return "", session.Session{}, errors.New("ZITADEL session does not include a user subject")
+	}
+	if err := s.sessions.Put(ctx, brokerToken, value); err != nil {
+		_ = s.zitadel.DeleteSession(ctx, upstreamSession.ID, upstreamSession.Token)
+		return "", session.Session{}, err
+	}
+	return brokerToken, value, nil
+}
+
+func (s *Service) ResolveLocalBroker(ctx context.Context, brokerToken string) (session.Session, error) {
+	value, err := s.sessions.Get(ctx, brokerToken)
+	if err != nil {
+		return session.Session{}, err
+	}
+	now := time.Now().UTC()
+	if value.CredentialKind != session.CredentialKindLocalBroker ||
+		value.Subject == "" ||
+		value.CredentialExpiresAt.IsZero() ||
+		!now.Before(value.CredentialExpiresAt) ||
+		!value.RevokedAt.IsZero() {
+		return session.Session{}, session.ErrNotFound
+	}
+	if s.roleRefresher != nil {
+		value, err = s.roleRefresher.Refresh(ctx, brokerToken, value)
+		if err != nil {
+			return session.Session{}, err
+		}
+	}
+	return value, nil
+}
+
 func (s *Service) Callback(response http.ResponseWriter, request *http.Request) {
 	state := request.URL.Query().Get("state")
 	tx, err := s.transactions.getTransaction(request.Context(), state)
@@ -902,6 +989,9 @@ func (s *Service) currentSession(request *http.Request) (session.Session, string
 	value, err := s.sessions.Get(request.Context(), cookie.Value)
 	if err != nil {
 		return session.Session{}, "", err
+	}
+	if value.CredentialKind == session.CredentialKindLocalBroker {
+		return session.Session{}, "", session.ErrNotFound
 	}
 	now := time.Now().UTC()
 	if !value.RevokedAt.IsZero() || now.Sub(value.LastSeenAt) > s.cfg.IdleTTL || now.Sub(value.CreatedAt) > s.cfg.AbsoluteTTL {

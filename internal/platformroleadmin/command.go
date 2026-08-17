@@ -40,6 +40,7 @@ type RoleCommand struct {
 	TargetUserID       string        `json:"targetUserId"`
 	BeforeRoles        []string      `json:"beforeRoles"`
 	AfterRoles         []string      `json:"afterRoles"`
+	ManagedRoles       []string      `json:"managedRoles,omitempty"`
 	RequestID          string        `json:"requestId,omitempty"`
 	RequestedAt        time.Time     `json:"requestedAt"`
 	UpdatedAt          time.Time     `json:"updatedAt"`
@@ -69,7 +70,13 @@ type CommandJournal interface {
 // Desired-state writes must be idempotent and preserve unrelated provider
 // roles. No production implementation is included in this phase.
 type ProviderRoleWriter interface {
-	SetPointsRoles(context.Context, string, []string) (User, error)
+	SetManagedRoles(context.Context, string, []string, []string) (User, error)
+}
+
+type ProviderRoleWriterFunc func(context.Context, string, []string, []string) (User, error)
+
+func (f ProviderRoleWriterFunc) SetManagedRoles(ctx context.Context, userID string, roles, managedRoles []string) (User, error) {
+	return f(ctx, userID, roles, managedRoles)
 }
 
 // ProviderError marks whether a provider failure proves that no mutation took
@@ -111,7 +118,7 @@ func NewDurableChangeExecutor(journal CommandJournal, provider ProviderRoleWrite
 	return &DurableChangeExecutor{journal: journal, provider: provider, ttl: ttl, lease: lease, now: time.Now}, nil
 }
 
-func (e *DurableChangeExecutor) ApplyPointsRoleChange(ctx context.Context, change RoleChange) (ChangeResult, error) {
+func (e *DurableChangeExecutor) ApplyRoleChange(ctx context.Context, change RoleChange) (ChangeResult, error) {
 	command := commandFromChange(change, e.now().UTC(), e.lease)
 	stored, created, err := e.journal.CreatePending(ctx, command, e.ttl)
 	if err != nil {
@@ -121,6 +128,15 @@ func (e *DurableChangeExecutor) ApplyPointsRoleChange(ctx context.Context, chang
 		return replayResult(stored)
 	}
 	return e.executeClaimed(ctx, stored)
+}
+
+// ApplyPointsRoleChange keeps the original Points-only API source compatible.
+// New callers should set ManagedRoles and use ApplyRoleChange.
+func (e *DurableChangeExecutor) ApplyPointsRoleChange(ctx context.Context, change RoleChange) (ChangeResult, error) {
+	if len(change.ManagedRoles) == 0 {
+		change.ManagedRoles = append([]string(nil), ManageableRoles...)
+	}
+	return e.ApplyRoleChange(ctx, change)
 }
 
 // ListRecoverableCommands is service logic for a future internal operations
@@ -159,7 +175,11 @@ func (m CommandManager) canManage() bool {
 }
 
 func (e *DurableChangeExecutor) executeClaimed(ctx context.Context, command RoleCommand) (ChangeResult, error) {
-	user, err := e.provider.SetPointsRoles(ctx, command.TargetUserID, append([]string(nil), command.AfterRoles...))
+	managedRoles := append([]string(nil), command.ManagedRoles...)
+	if len(managedRoles) == 0 {
+		managedRoles = append([]string(nil), ManageableRoles...)
+	}
+	user, err := e.provider.SetManagedRoles(ctx, command.TargetUserID, append([]string(nil), command.AfterRoles...), managedRoles)
 	now := e.now().UTC()
 	if err != nil {
 		var providerError *ProviderError
@@ -187,7 +207,11 @@ func (e *DurableChangeExecutor) executeClaimed(ctx context.Context, command Role
 
 func commandFromChange(change RoleChange, now time.Time, lease time.Duration) RoleCommand {
 	operationHash := sha256.Sum256([]byte(change.ActorSubject + "\x00" + change.IdempotencyKey))
-	fingerprintHash := sha256.Sum256([]byte(change.TargetUserID + "\x00" + strings.Join(change.AfterRoles, "\x00")))
+	fingerprintInput := change.TargetUserID + "\x00" + strings.Join(change.AfterRoles, "\x00")
+	if len(change.ManagedRoles) > 0 && !sameRoleSet(change.ManagedRoles, ManageableRoles) {
+		fingerprintInput = change.TargetUserID + "\x00" + strings.Join(change.ManagedRoles, "\x00") + "\x01" + strings.Join(change.AfterRoles, "\x00")
+	}
+	fingerprintHash := sha256.Sum256([]byte(fingerprintInput))
 	requestedAt := change.RequestedAt.UTC()
 	if requestedAt.IsZero() {
 		requestedAt = now
@@ -196,8 +220,17 @@ func commandFromChange(change RoleChange, now time.Time, lease time.Duration) Ro
 		OperationID: hex.EncodeToString(operationHash[:]), PayloadFingerprint: hex.EncodeToString(fingerprintHash[:]),
 		Status: CommandPending, ActorSubject: change.ActorSubject, TargetUserID: change.TargetUserID,
 		BeforeRoles: append([]string(nil), change.BeforeRoles...), AfterRoles: append([]string(nil), change.AfterRoles...),
-		RequestID: change.RequestID, RequestedAt: requestedAt, UpdatedAt: now, LeaseUntil: now.Add(lease), Attempts: 1, Version: 1,
+		ManagedRoles: append([]string(nil), change.ManagedRoles...),
+		RequestID:    change.RequestID, RequestedAt: requestedAt, UpdatedAt: now, LeaseUntil: now.Add(lease), Attempts: 1, Version: 1,
 	}
+}
+
+func sameRoleSet(left, right []string) bool {
+	leftCopy := append([]string(nil), left...)
+	rightCopy := append([]string(nil), right...)
+	slices.Sort(leftCopy)
+	slices.Sort(rightCopy)
+	return slices.Equal(leftCopy, rightCopy)
 }
 
 func replayResult(command RoleCommand) (ChangeResult, error) {

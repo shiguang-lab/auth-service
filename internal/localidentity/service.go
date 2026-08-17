@@ -47,8 +47,8 @@ type fixtureUser struct {
 }
 
 var fixtureUsers = []fixtureUser{
-	{ID: "local-ordinary", LoginName: "ordinary@local.test", DisplayName: "普通用户"},
-	{ID: "local-owner", LoginName: "owner@local.test", DisplayName: "应用所有者"},
+	{ID: "local-ordinary", LoginName: "ordinary@local.test", DisplayName: "普通用户", Roles: []string{platformroleadmin.HuiguangUserRole, platformroleadmin.YingguangUserRole, platformroleadmin.LingguangUserRole}},
+	{ID: "local-owner", LoginName: "owner@local.test", DisplayName: "应用所有者", Roles: []string{platformroleadmin.LingguangDevRole}},
 	{ID: "local-other-owner", LoginName: "other-owner@local.test", DisplayName: "其他应用所有者"},
 	{ID: "local-auditor", LoginName: "auditor@local.test", DisplayName: "积分审计员", Roles: []string{platformroleadmin.PointsAuditorRole}},
 	{ID: "local-points-admin", LoginName: "points-admin@local.test", DisplayName: "积分平台管理员", Roles: []string{platformroleadmin.PointsAdminRole}},
@@ -170,10 +170,16 @@ func (s *Service) Session(response http.ResponseWriter, request *http.Request) {
 		"authenticated": true, "subject": value.Subject, "displayName": value.DisplayName,
 		"preferredUsername": value.PreferredUsername, "entitlements": value.Entitlements,
 		"roles": value.Roles, "platformRoles": value.PlatformRoles,
-		"iamCapabilities": map[string]any{"pointsRoleAssignments": map[string]any{
-			"read": manage, "write": manage,
-			"manageableRoles": []string{platformroleadmin.PointsAdminRole, platformroleadmin.PointsAuditorRole},
-		}},
+		"iamCapabilities": map[string]any{
+			"pointsRoleAssignments": map[string]any{
+				"read": manage, "write": manage,
+				"manageableRoles": append([]string(nil), platformroleadmin.ManageableRoles...),
+			},
+			"productRoleAssignments": map[string]any{
+				"read": manage, "write": manage,
+				"manageableRoles": append([]string(nil), platformroleadmin.ProductManageableRoles...),
+			},
+		},
 	})
 }
 
@@ -246,10 +252,27 @@ func (s *Service) GetUser(ctx context.Context, userID string) (platformroleadmin
 }
 
 func (s *Service) SetPointsRoles(ctx context.Context, userID string, roles []string) (platformroleadmin.User, error) {
+	return s.setScopedRoles(ctx, userID, roles, platformroleadmin.ManageableRoles)
+}
+
+func (s *Service) SetProductRoles(ctx context.Context, userID string, roles []string) (platformroleadmin.User, error) {
+	return s.setScopedRoles(ctx, userID, roles, platformroleadmin.ProductManageableRoles)
+}
+
+func (s *Service) SetManagedRoles(ctx context.Context, userID string, roles, managedRoles []string) (platformroleadmin.User, error) {
+	return s.setScopedRoles(ctx, userID, roles, managedRoles)
+}
+
+func (s *Service) setScopedRoles(ctx context.Context, userID string, desired, scope []string) (platformroleadmin.User, error) {
 	if _, ok := findUser(userID); !ok {
 		return platformroleadmin.User{}, &platformroleadmin.ProviderError{Code: "user_not_found", Definitive: true}
 	}
-	body, err := json.Marshal(roles)
+	current, err := s.roles(ctx, userID)
+	if err != nil {
+		return platformroleadmin.User{}, err
+	}
+	next := replaceScopedRoles(current, desired, scope)
+	body, err := json.Marshal(next)
 	if err != nil {
 		return platformroleadmin.User{}, err
 	}
@@ -260,6 +283,22 @@ func (s *Service) SetPointsRoles(ctx context.Context, userID string, roles []str
 		return platformroleadmin.User{}, context.DeadlineExceeded
 	}
 	return s.GetUser(ctx, userID)
+}
+
+func replaceScopedRoles(current, desired, scope []string) []string {
+	managed := make(map[string]struct{}, len(scope))
+	for _, role := range scope {
+		managed[role] = struct{}{}
+	}
+	next := make([]string, 0, len(current)+len(desired))
+	for _, role := range current {
+		if _, replace := managed[role]; !replace {
+			next = append(next, role)
+		}
+	}
+	next = append(next, desired...)
+	slices.Sort(next)
+	return slices.Compact(next)
 }
 
 func (s *Service) Record(_ context.Context, event platformroleadmin.AuditEvent) error {

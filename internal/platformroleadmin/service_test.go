@@ -67,7 +67,7 @@ func (d *memoryDirectory) GetUser(_ context.Context, userID string) (User, error
 	return user, nil
 }
 
-func (d *memoryDirectory) ApplyPointsRoleChange(_ context.Context, change RoleChange) (ChangeResult, error) {
+func (d *memoryDirectory) ApplyRoleChange(_ context.Context, change RoleChange) (ChangeResult, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.changeErr != nil {
@@ -149,6 +149,41 @@ func TestRoleManagementAuthorizationAllowlistAndIdempotency(t *testing.T) {
 	assertError(t, unmanaged, http.StatusUnprocessableEntity, "iam_role_not_manageable")
 	unknown := serve(manager, http.MethodPut, "/api/auth/iam/points-role-assignments/target", `{"roles":[],"issuer":"forged"}`)
 	assertError(t, unknown, http.StatusBadRequest, "invalid_request")
+}
+
+func TestProductRoleManagementAndPortalAccess(t *testing.T) {
+	directory := testDirectory()
+	resolver := fakeResolver{session.Session{
+		Subject:       "iam-manager",
+		PlatformRoles: []string{IAMManagerRole, HuiguangUserRole, LingguangDevRole, PointsAdminRole},
+	}}
+	service := NewProductService(resolver, directory, directory, &memoryAudit{}, []string{testRoleAdminOrigin}, nil)
+	handler := newProductHandler(service)
+
+	access := serve(handler, http.MethodGet, "/api/auth/portal/access", "")
+	assertStatus(t, access, http.StatusOK)
+	var accessBody struct {
+		Revision string `json:"revision"`
+		Products []struct {
+			ID     string   `json:"id"`
+			Status string   `json:"status"`
+			Roles  []string `json:"roles"`
+		} `json:"products"`
+	}
+	if err := json.Unmarshal(access.Body.Bytes(), &accessBody); err != nil || accessBody.Revision == "" || len(accessBody.Products) != 4 {
+		t.Fatalf("portal access = %s", access.Body.String())
+	}
+	if accessBody.Products[0].ID != "huiguang" || accessBody.Products[0].Status != "active" || accessBody.Products[3].ID != "points" || accessBody.Products[3].Status != "active" {
+		t.Fatalf("portal products = %#v", accessBody.Products)
+	}
+
+	update := serve(handler, http.MethodPut, "/api/auth/iam/product-role-assignments/target", `{"roles":["huiguang:user","yingguang:ops-admin","lingguang:developer"]}`)
+	assertStatus(t, update, http.StatusOK)
+	if directory.writes != 1 || len(directory.changes) != 1 || len(directory.changes[0].ManagedRoles) != len(ProductManageableRoles) {
+		t.Fatalf("product change = writes:%d changes:%#v", directory.writes, directory.changes)
+	}
+	unmanaged := serve(handler, http.MethodPut, "/api/auth/iam/product-role-assignments/other", `{"roles":["platform:admin"]}`)
+	assertError(t, unmanaged, http.StatusUnprocessableEntity, "iam_role_not_manageable")
 }
 
 func TestOnlyIAMManagerCanUseAPIAndCannotModifySelf(t *testing.T) {
@@ -246,6 +281,15 @@ func newHandler(service *Service) http.Handler {
 	router.Post("/api/auth/iam/points-role-assignments/search", service.SearchHandler)
 	router.Post("/api/auth/iam/points-role-assignments/resolve", service.ResolveHandler)
 	router.Put("/api/auth/iam/points-role-assignments/{userID}", service.UpdateHandler)
+	return router
+}
+
+func newProductHandler(service *Service) http.Handler {
+	router := chi.NewRouter()
+	router.Get("/api/auth/portal/access", service.PortalAccessHandler)
+	router.Post("/api/auth/iam/product-role-assignments/search", service.SearchHandler)
+	router.Post("/api/auth/iam/product-role-assignments/resolve", service.ResolveHandler)
+	router.Put("/api/auth/iam/product-role-assignments/{userID}", service.UpdateHandler)
 	return router
 }
 

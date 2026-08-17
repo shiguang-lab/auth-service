@@ -14,7 +14,7 @@ type fakeProviderWriter struct {
 	err   error
 }
 
-func (p *fakeProviderWriter) SetPointsRoles(_ context.Context, target string, roles []string) (User, error) {
+func (p *fakeProviderWriter) SetManagedRoles(_ context.Context, target string, roles, _ []string) (User, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.calls++
@@ -150,4 +150,15 @@ func mustExecutor(t *testing.T, journal CommandJournal, provider ProviderRoleWri
 
 func testRoleChange(key string, roles []string) RoleChange {
 	return RoleChange{IdempotencyKey: key, ActorSubject: "iam-manager", TargetUserID: "target", BeforeRoles: nil, AfterRoles: roles, RequestID: "request-1", RequestedAt: time.Now().UTC()}
+}
+
+func TestPointsCommandFingerprintRemainsBackwardCompatible(t *testing.T) {
+	legacy := testRoleChange("legacy-key", []string{PointsAdminRole})
+	withScope := legacy
+	withScope.ManagedRoles = []string{PointsAuditorRole, PointsAdminRole}
+	legacyCommand := commandFromChange(legacy, time.Now().UTC(), 30*time.Second)
+	scopedCommand := commandFromChange(withScope, time.Now().UTC(), 30*time.Second)
+	if legacyCommand.PayloadFingerprint != scopedCommand.PayloadFingerprint {
+		t.Fatalf("legacy=%s scoped=%s", legacyCommand.PayloadFingerprint, scopedCommand.PayloadFingerprint)
+	}
 }

@@ -1,12 +1,14 @@
-// Package platformroleadmin owns the narrow IAM contract for assigning Points
-// platform roles. Application OWNER/ADMIN membership is intentionally outside
-// this package and remains in Points Service.
+// Package platformroleadmin owns the IAM contract for assigning allowlisted
+// platform product roles. Product-internal resource permissions remain in each
+// product service.
 package platformroleadmin
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -22,15 +24,30 @@ import (
 )
 
 const (
-	IAMManagerRole    = "opc:system-admin"
-	PointsAdminRole   = "platform:points-admin"
-	PointsAuditorRole = "platform:points-auditor"
-	maxRequestBytes   = 16 << 10
+	IAMManagerRole      = "opc:system-admin"
+	PointsAdminRole     = "platform:points-admin"
+	PointsAuditorRole   = "platform:points-auditor"
+	HuiguangUserRole    = "huiguang:user"
+	HuiguangGrayRole    = "huiguang:gray-creator"
+	HuiguangOpsRole     = "huiguang:ops-admin"
+	YingguangUserRole   = "yingguang:user"
+	YingguangOpsRole    = "yingguang:ops-admin"
+	LingguangUserRole   = "lingguang:consumer"
+	LingguangDevRole    = "lingguang:developer"
+	LingguangReviewRole = "lingguang:reviewer"
+	LingguangAdminRole  = "lingguang:platform-admin"
+	maxRequestBytes     = 16 << 10
 )
 
 var (
-	ManageableRoles = []string{PointsAdminRole, PointsAuditorRole}
-	ErrUnavailable  = errors.New("IAM role directory is unavailable")
+	ManageableRoles        = []string{PointsAdminRole, PointsAuditorRole}
+	ProductManageableRoles = []string{
+		HuiguangUserRole, HuiguangGrayRole, HuiguangOpsRole,
+		YingguangUserRole, YingguangOpsRole,
+		LingguangUserRole, LingguangDevRole, LingguangReviewRole, LingguangAdminRole,
+		PointsAuditorRole, PointsAdminRole,
+	}
+	ErrUnavailable = errors.New("IAM role directory is unavailable")
 )
 
 type User struct {
@@ -55,6 +72,7 @@ type RoleChange struct {
 	TargetUserID   string
 	BeforeRoles    []string
 	AfterRoles     []string
+	ManagedRoles   []string
 	RequestID      string
 	RequestedAt    time.Time
 }
@@ -70,7 +88,7 @@ type ChangeResult struct {
 // adapter yet. A future implementation must use a fixed project, preserve
 // unrelated roles, and own a durable, idempotent command journal.
 type ChangeExecutor interface {
-	ApplyPointsRoleChange(context.Context, RoleChange) (ChangeResult, error)
+	ApplyRoleChange(context.Context, RoleChange) (ChangeResult, error)
 }
 
 type AuditEvent struct {
@@ -93,17 +111,26 @@ type sessionResolver interface {
 }
 
 type Service struct {
-	resolver  sessionResolver
-	directory Directory
-	executor  ChangeExecutor
-	audit     AuditSink
-	origins   map[string]struct{}
-	logger    *slog.Logger
-	now       func() time.Time
-	limits    *rateLimits
+	resolver   sessionResolver
+	directory  Directory
+	executor   ChangeExecutor
+	audit      AuditSink
+	origins    map[string]struct{}
+	logger     *slog.Logger
+	now        func() time.Time
+	limits     *rateLimits
+	manageable map[string]struct{}
 }
 
 func NewService(resolver sessionResolver, directory Directory, executor ChangeExecutor, audit AuditSink, allowedOrigins []string, logger *slog.Logger) *Service {
+	return newService(resolver, directory, executor, audit, allowedOrigins, ManageableRoles, logger)
+}
+
+func NewProductService(resolver sessionResolver, directory Directory, executor ChangeExecutor, audit AuditSink, allowedOrigins []string, logger *slog.Logger) *Service {
+	return newService(resolver, directory, executor, audit, allowedOrigins, ProductManageableRoles, logger)
+}
+
+func newService(resolver sessionResolver, directory Directory, executor ChangeExecutor, audit AuditSink, allowedOrigins, manageableRoles []string, logger *slog.Logger) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -113,10 +140,53 @@ func NewService(resolver sessionResolver, directory Directory, executor ChangeEx
 			origins[origin] = struct{}{}
 		}
 	}
+	manageable := make(map[string]struct{}, len(manageableRoles))
+	for _, role := range manageableRoles {
+		manageable[role] = struct{}{}
+	}
 	return &Service{
 		resolver: resolver, directory: directory, executor: executor, audit: audit, origins: origins, logger: logger,
-		now: time.Now, limits: newRateLimits(30, 10, time.Minute),
+		now: time.Now, limits: newRateLimits(30, 10, time.Minute), manageable: manageable,
 	}
+}
+
+func (s *Service) PortalAccessHandler(response http.ResponseWriter, request *http.Request) {
+	if s.resolver == nil {
+		writeJSON(response, http.StatusServiceUnavailable, map[string]string{"error": "portal_access_unavailable"})
+		return
+	}
+	current, _, err := s.resolver.ResolveSession(request)
+	if err != nil {
+		writeJSON(response, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	roles, _ := s.normalizeDirectoryRoles(current.PlatformRoles)
+	product := func(id string, prefixes []string, always bool) map[string]any {
+		assigned := make([]string, 0, len(roles))
+		for _, role := range roles {
+			for _, prefix := range prefixes {
+				if strings.HasPrefix(role, prefix) {
+					assigned = append(assigned, role)
+					break
+				}
+			}
+		}
+		status := "unassigned"
+		if always || len(assigned) > 0 {
+			status = "active"
+		}
+		return map[string]any{"id": id, "status": status, "roles": assigned, "source": "iam"}
+	}
+	revisionHash := sha256.Sum256([]byte(current.Subject + "\x00" + strings.Join(roles, "\x00") + "\x00" + current.PlatformRolesRefreshedAt.UTC().Format(time.RFC3339Nano)))
+	writeJSON(response, http.StatusOK, map[string]any{
+		"revision": fmt.Sprintf("r%x", revisionHash[:8]),
+		"products": []map[string]any{
+			product("huiguang", []string{"huiguang:"}, false),
+			product("yingguang", []string{"yingguang:"}, false),
+			product("lingguang", []string{"lingguang:"}, false),
+			product("points", []string{"platform:points-"}, true),
+		},
+	})
 }
 
 func (s *Service) SearchHandler(response http.ResponseWriter, request *http.Request) {
@@ -153,7 +223,7 @@ func (s *Service) SearchHandler(response http.ResponseWriter, request *http.Requ
 	}
 	result := make([]User, 0, len(users))
 	for _, user := range users {
-		if normalized, valid := normalizeUser(user); valid {
+		if normalized, valid := s.normalizeUser(user); valid {
 			result = append(result, normalized)
 		}
 	}
@@ -212,7 +282,7 @@ func (s *Service) UpdateHandler(response http.ResponseWriter, request *http.Requ
 		writeJSON(response, requestErrorStatus(err), map[string]string{"error": "invalid_request"})
 		return
 	}
-	desired, valid := normalizeRoles(input.Roles)
+	desired, valid := s.normalizeRequestedRoles(input.Roles)
 	if !valid {
 		s.denied(request, actor.Subject, targetID, "IAM_POINTS_ROLES_UPDATE_DENIED", "role_not_allowlisted")
 		writeJSON(response, http.StatusUnprocessableEntity, map[string]string{"error": "iam_role_not_manageable"})
@@ -223,7 +293,7 @@ func (s *Service) UpdateHandler(response http.ResponseWriter, request *http.Requ
 		s.upstreamError(response, err)
 		return
 	}
-	before, _ := normalizeRoles(current.Roles)
+	before, _ := s.normalizeDirectoryRoles(current.Roles)
 	if slices.Equal(before, desired) && s.executor == nil {
 		current.Roles = desired
 		writeJSON(response, http.StatusOK, map[string]any{"user": current, "changed": false})
@@ -244,10 +314,11 @@ func (s *Service) UpdateHandler(response http.ResponseWriter, request *http.Requ
 		TargetUserID:   targetID,
 		BeforeRoles:    before,
 		AfterRoles:     desired,
+		ManagedRoles:   s.manageableRoleList(),
 		RequestID:      middleware.GetReqID(request.Context()),
 		RequestedAt:    s.now().UTC(),
 	}
-	result, err := s.executor.ApplyPointsRoleChange(request.Context(), change)
+	result, err := s.executor.ApplyRoleChange(request.Context(), change)
 	if err != nil {
 		if errors.Is(err, ErrIdempotencyConflict) {
 			writeJSON(response, http.StatusConflict, map[string]string{"error": "idempotency_conflict"})
@@ -267,12 +338,21 @@ func (s *Service) UpdateHandler(response http.ResponseWriter, request *http.Requ
 	}
 	updated := current
 	updated.Roles = append([]string(nil), result.User.Roles...)
-	updated, valid = normalizeUser(updated)
+	updated, valid = s.normalizeUser(updated)
 	if !valid {
 		writeJSON(response, http.StatusServiceUnavailable, map[string]string{"error": "iam_role_change_unavailable"})
 		return
 	}
 	writeJSON(response, http.StatusOK, map[string]any{"user": updated, "changed": result.Changed, "operationId": result.OperationID, "replayed": result.Replayed})
+}
+
+func (s *Service) manageableRoleList() []string {
+	roles := make([]string, 0, len(s.manageable))
+	for role := range s.manageable {
+		roles = append(roles, role)
+	}
+	slices.Sort(roles)
+	return roles
 }
 
 func (s *Service) authorize(response http.ResponseWriter, request *http.Request, action, target string) (session.Session, bool) {
@@ -311,7 +391,7 @@ func (s *Service) getUser(ctx context.Context, userID string) (User, error) {
 	if err != nil {
 		return User{}, err
 	}
-	user, valid := normalizeUser(user)
+	user, valid := s.normalizeUser(user)
 	if !valid {
 		return User{}, ErrUnavailable
 	}
@@ -334,14 +414,14 @@ func (s *Service) upstreamError(response http.ResponseWriter, err error) {
 	writeJSON(response, http.StatusServiceUnavailable, map[string]string{"error": "iam_role_directory_unavailable"})
 }
 
-func normalizeUser(user User) (User, bool) {
+func (s *Service) normalizeUser(user User) (User, bool) {
 	user.ID = strings.TrimSpace(user.ID)
 	user.LoginName = strings.TrimSpace(user.LoginName)
 	user.DisplayName = strings.TrimSpace(user.DisplayName)
 	if user.ID == "" || user.LoginName == "" || user.State != "ACTIVE" {
 		return User{}, false
 	}
-	roles, valid := normalizeRoles(user.Roles)
+	roles, valid := s.normalizeDirectoryRoles(user.Roles)
 	if !valid {
 		return User{}, false
 	}
@@ -349,13 +429,30 @@ func normalizeUser(user User) (User, bool) {
 	return user, true
 }
 
-func normalizeRoles(roles []string) ([]string, bool) {
+func (s *Service) normalizeRequestedRoles(roles []string) ([]string, bool) {
 	result := make([]string, 0, len(roles))
 	seen := make(map[string]struct{}, len(roles))
 	for _, role := range roles {
 		role = strings.TrimSpace(role)
-		if role != PointsAdminRole && role != PointsAuditorRole {
+		if _, allowed := s.manageable[role]; !allowed {
 			return nil, false
+		}
+		if _, exists := seen[role]; !exists {
+			seen[role] = struct{}{}
+			result = append(result, role)
+		}
+	}
+	slices.Sort(result)
+	return result, true
+}
+
+func (s *Service) normalizeDirectoryRoles(roles []string) ([]string, bool) {
+	result := make([]string, 0, len(roles))
+	seen := make(map[string]struct{}, len(roles))
+	for _, role := range roles {
+		role = strings.TrimSpace(role)
+		if _, allowed := s.manageable[role]; !allowed {
+			continue
 		}
 		if _, exists := seen[role]; !exists {
 			seen[role] = struct{}{}

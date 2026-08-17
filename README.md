@@ -37,8 +37,10 @@ the shared browser cookie or ZITADEL tokens.
 - ZITADEL IDP Intent callbacks for GitHub/Google; existing links sign in directly and new identities continue in Website's custom registration page
 - Parent-domain opaque session creation, inspection, and logout
 - Origin validation, CSRF protection, and Redis login rate limiting
-- Points-only, server-side user search and exact ACTIVE-user resolution with a
-  credential independent from browser, gateway, and general identity tokens
+- Portal product-role aggregation plus bounded ACTIVE-user directory search for
+  绘光、映光、灵光 and Points role administration
+- Backward-compatible Points-only IAM endpoints and fail-closed production
+  writes until a permanent audit sink and ZITADEL writer are configured
 - 60-second platform-role freshness with process-local concurrent refresh
   suppression and privilege-clearing failure behavior
 
@@ -106,6 +108,10 @@ production startup keeps the IAM writer nil and fail-closed.
 | `POST` | `/api/auth/register/federated` | Gateway token + Origin + CSRF |
 | `GET` | `/api/auth/session` | Gateway token + session cookie |
 | `POST` | `/api/auth/logout` | Gateway token + Origin |
+| `GET` | `/api/auth/portal/access` | Gateway token + session cookie |
+| `POST` | `/api/auth/iam/product-role-assignments/search` | Gateway token + IAM manager session + Origin |
+| `POST` | `/api/auth/iam/product-role-assignments/resolve` | Gateway token + IAM manager session + Origin |
+| `PUT` | `/api/auth/iam/product-role-assignments/{userId}` | Gateway token + IAM manager session + Origin + idempotency key |
 | `POST` | `/v1/identity/users/search` | `POINTS_IDENTITY_SERVICE_TOKEN`; server-side only |
 | `POST` | `/v1/identity/users/resolve` | `POINTS_IDENTITY_SERVICE_TOKEN`; server-side only |
 

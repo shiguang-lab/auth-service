@@ -2,9 +2,39 @@ package localidentity
 
 import (
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
+
+	"github.com/shiguanglab/auth-service/internal/platformroleadmin"
 )
+
+func TestScopedRoleReplacementPreservesOtherProductsAndGlobalRoles(t *testing.T) {
+	current := []string{
+		platformroleadmin.IAMManagerRole,
+		platformroleadmin.HuiguangUserRole,
+		platformroleadmin.YingguangUserRole,
+		platformroleadmin.PointsAuditorRole,
+	}
+	points := replaceScopedRoles(current, []string{platformroleadmin.PointsAdminRole}, platformroleadmin.ManageableRoles)
+	wantPoints := []string{
+		platformroleadmin.HuiguangUserRole,
+		platformroleadmin.IAMManagerRole,
+		platformroleadmin.PointsAdminRole,
+		platformroleadmin.YingguangUserRole,
+	}
+	slices.Sort(wantPoints)
+	if !slices.Equal(points, wantPoints) {
+		t.Fatalf("points replacement = %#v, want %#v", points, wantPoints)
+	}
+
+	products := replaceScopedRoles(current, []string{platformroleadmin.LingguangDevRole}, platformroleadmin.ProductManageableRoles)
+	wantProducts := []string{platformroleadmin.IAMManagerRole, platformroleadmin.LingguangDevRole}
+	slices.Sort(wantProducts)
+	if !slices.Equal(products, wantProducts) {
+		t.Fatalf("product replacement = %#v, want %#v", products, wantProducts)
+	}
+}
 
 func TestSafeReturnToAcceptsOnlyLocalPathsAndConfiguredOrigin(t *testing.T) {
 	service := &Service{cfg: Config{Origin: "http://127.0.0.1:18080"}}

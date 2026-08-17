@@ -959,6 +959,16 @@ func (s *Service) Session(response http.ResponseWriter, request *http.Request) {
 				"write":           slices.Contains(value.PlatformRoles, "opc:system-admin"),
 				"manageableRoles": []string{"platform:points-admin", "platform:points-auditor"},
 			},
+			"productRoleAssignments": map[string]any{
+				"read":  slices.Contains(value.PlatformRoles, "opc:system-admin"),
+				"write": slices.Contains(value.PlatformRoles, "opc:system-admin"),
+				"manageableRoles": []string{
+					"huiguang:user", "huiguang:gray-creator", "huiguang:ops-admin",
+					"yingguang:user", "yingguang:ops-admin",
+					"lingguang:consumer", "lingguang:developer", "lingguang:reviewer", "lingguang:platform-admin",
+					"platform:points-auditor", "platform:points-admin",
+				},
+			},
 		},
 	})
 }

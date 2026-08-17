@@ -110,6 +110,15 @@ for role in \
   "org:member|Organization Member" \
   "org:viewer|Organization Viewer" \
   "opc:system-admin|OPC 系统管理员" \
+  "huiguang:user|绘光使用用户" \
+  "huiguang:gray-creator|绘光灰度创作者" \
+  "huiguang:ops-admin|绘光管理员" \
+  "yingguang:user|映光创作者" \
+  "yingguang:ops-admin|映光管理员" \
+  "lingguang:consumer|灵光使用用户" \
+  "lingguang:developer|灵光开发者" \
+  "lingguang:reviewer|灵光审核员" \
+  "lingguang:platform-admin|灵光管理员" \
   "platform:points-admin|Points Administrator" \
   "platform:points-auditor|Points Auditor"; do
   key="${role%%|*}"; display="${role#*|}"

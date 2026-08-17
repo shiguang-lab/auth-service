@@ -124,6 +124,7 @@ func main() {
 		decision.WithPlatformRoleRefresher(localFixture)
 	}
 	var directory *zitadel.Client
+	var roleDirectory platformroleadmin.Directory
 	if login != nil && cfg.ZitadelProjectID != "" {
 		directory, err = zitadel.NewClient(
 			cfg.ZitadelInternalURL,
@@ -136,6 +137,7 @@ func main() {
 			logger.Error("initialize platform directory client", "error", err)
 			os.Exit(1)
 		}
+		roleDirectory = platformroleadmin.NewZitadelDirectory(directory, cfg.ZitadelOrganizationID, cfg.ZitadelProjectID)
 		roleRefresher := platformroles.New(store, directory, cfg.ZitadelOrganizationID, cfg.ZitadelProjectID, logger)
 		login.WithPlatformRoleRefresher(roleRefresher)
 		decision.WithPlatformRoleRefresher(roleRefresher)
@@ -175,10 +177,12 @@ func main() {
 	if localFixture != nil {
 		api.WithLocalIdentity(localFixture)
 		api.WithPlatformRoleAdmin(platformroleadmin.NewService(localFixture, localFixture, localExecutor, localFixture, cfg.IAMRoleAdminOrigins, logger))
+		api.WithProductRoleAdmin(platformroleadmin.NewProductService(localFixture, localFixture, localExecutor, localFixture, cfg.IAMRoleAdminOrigins, logger))
 	} else if login != nil {
 		// The Redis command journal is ready when configured, but the executor
 		// remains nil until a ZITADEL writer and permanent audit sink are approved.
-		api.WithPlatformRoleAdmin(platformroleadmin.NewService(login, nil, nil, nil, cfg.IAMRoleAdminOrigins, logger))
+		api.WithPlatformRoleAdmin(platformroleadmin.NewService(login, roleDirectory, nil, nil, cfg.IAMRoleAdminOrigins, logger))
+		api.WithProductRoleAdmin(platformroleadmin.NewProductService(login, roleDirectory, nil, nil, cfg.IAMRoleAdminOrigins, logger))
 	}
 	if directory != nil {
 		api.WithOrganizations(orgservice.NewService(cfg, store, login, directory, logger))

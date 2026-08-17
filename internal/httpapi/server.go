@@ -33,16 +33,17 @@ const (
 type ReadinessCheck func(context.Context) error
 
 type Server struct {
-	decision      *authorize.Service
-	signer        *identity.Signer
-	gatewayToken  [32]byte
-	readiness     ReadinessCheck
-	logger        *slog.Logger
-	login         *loginservice.Service
-	orgs          *orgservice.Service
-	roleAdmin     *platformroleadmin.Service
-	localIdentity *localidentity.Service
-	localBrokers  map[string]LocalBrokerPolicy
+	decision         *authorize.Service
+	signer           *identity.Signer
+	gatewayToken     [32]byte
+	readiness        ReadinessCheck
+	logger           *slog.Logger
+	login            *loginservice.Service
+	orgs             *orgservice.Service
+	roleAdmin        *platformroleadmin.Service
+	productRoleAdmin *platformroleadmin.Service
+	localIdentity    *localidentity.Service
+	localBrokers     map[string]LocalBrokerPolicy
 }
 
 type LocalBrokerPolicy struct {
@@ -72,6 +73,11 @@ func (s *Server) WithLocalBroker(policy LocalBrokerPolicy) *Server {
 // service itself remains fail-closed when no production writer is configured.
 func (s *Server) WithPlatformRoleAdmin(service *platformroleadmin.Service) *Server {
 	s.roleAdmin = service
+	return s
+}
+
+func (s *Server) WithProductRoleAdmin(service *platformroleadmin.Service) *Server {
+	s.productRoleAdmin = service
 	return s
 }
 
@@ -130,6 +136,12 @@ func (s *Server) Handler() http.Handler {
 				local.Post("/api/auth/iam/points-role-assignments/resolve", s.roleAdmin.ResolveHandler)
 				local.Put("/api/auth/iam/points-role-assignments/{userID}", s.roleAdmin.UpdateHandler)
 			}
+			if s.productRoleAdmin != nil {
+				local.Get("/api/auth/portal/access", s.productRoleAdmin.PortalAccessHandler)
+				local.Post("/api/auth/iam/product-role-assignments/search", s.productRoleAdmin.SearchHandler)
+				local.Post("/api/auth/iam/product-role-assignments/resolve", s.productRoleAdmin.ResolveHandler)
+				local.Put("/api/auth/iam/product-role-assignments/{userID}", s.productRoleAdmin.UpdateHandler)
+			}
 			local.Post("/api/auth/local/provider/fail-next", s.localIdentity.FailNextProviderWrite)
 			local.Get("/api/auth/local/iam-commands", s.localIdentity.ListCommands)
 			local.Post("/api/auth/local/iam-commands/{operationID}/retry", s.localIdentity.RetryCommand)
@@ -162,6 +174,12 @@ func (s *Server) Handler() http.Handler {
 				auth.Post("/api/auth/iam/points-role-assignments/search", s.roleAdmin.SearchHandler)
 				auth.Post("/api/auth/iam/points-role-assignments/resolve", s.roleAdmin.ResolveHandler)
 				auth.Put("/api/auth/iam/points-role-assignments/{userID}", s.roleAdmin.UpdateHandler)
+			}
+			if s.productRoleAdmin != nil {
+				auth.Get("/api/auth/portal/access", s.productRoleAdmin.PortalAccessHandler)
+				auth.Post("/api/auth/iam/product-role-assignments/search", s.productRoleAdmin.SearchHandler)
+				auth.Post("/api/auth/iam/product-role-assignments/resolve", s.productRoleAdmin.ResolveHandler)
+				auth.Put("/api/auth/iam/product-role-assignments/{userID}", s.productRoleAdmin.UpdateHandler)
 			}
 			if s.orgs != nil {
 				auth.Post("/api/auth/context", s.orgs.SwitchContextHandler)

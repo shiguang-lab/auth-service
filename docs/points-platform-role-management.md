@@ -30,8 +30,9 @@ Auth Service refreshes the session's platform roles and requires
 `opc:system-admin` on every request.
 
 Every endpoint also requires an exact browser `Origin` from the dedicated
-`IAM_ROLE_ADMIN_ORIGINS` allowlist. Production defaults to only
-`https://points.shiguanglab.com`; the broader first-party return-origin list is
+`IAM_ROLE_ADMIN_ORIGINS` allowlist. Production defaults to the Portal origin
+`https://shiguanglab.com` and the Points administration origin
+`https://point.shiguanglab.com`; the broader first-party return-origin list is
 intentionally not reused, so a compromised sibling product cannot submit IAM
 role changes with the shared parent-domain session cookie.
 

@@ -126,7 +126,7 @@ func TestAuthorizeJSONDecisionContract(t *testing.T) {
 		{
 			name: "allow issues identity",
 			input: authorize.Request{
-				Method: http.MethodGet, Host: "points.shiguanglab.com", Path: "/api/v1/me/points",
+				Method: http.MethodGet, Host: "point.shiguanglab.com", Path: "/api/v1/me/points",
 				ProductID: "points", Audience: "points-service", Cookie: "__Secure-sg_session=opaque-session",
 				RequiredEntitlements: []string{"platform:access"},
 			},
@@ -135,7 +135,7 @@ func TestAuthorizeJSONDecisionContract(t *testing.T) {
 		{
 			name: "missing session is structured unauthorized",
 			input: authorize.Request{
-				Method: http.MethodPost, Host: "points.shiguanglab.com", Path: "/api/v1/me/check-ins",
+				Method: http.MethodPost, Host: "point.shiguanglab.com", Path: "/api/v1/me/check-ins",
 				ProductID: "points", Audience: "points-service", Accept: "application/json",
 			},
 			wantStatus: http.StatusUnauthorized, wantReason: "session_missing",
@@ -143,7 +143,7 @@ func TestAuthorizeJSONDecisionContract(t *testing.T) {
 		{
 			name: "missing entitlement is structured forbidden",
 			input: authorize.Request{
-				Method: http.MethodGet, Host: "points.shiguanglab.com", Path: "/api/v1/admin/points/accounts",
+				Method: http.MethodGet, Host: "point.shiguanglab.com", Path: "/api/v1/admin/points/accounts",
 				ProductID: "points", Audience: "points-service", Cookie: "__Secure-sg_session=opaque-session",
 				RequiredEntitlements: []string{"platform:admin"},
 			},
@@ -152,7 +152,7 @@ func TestAuthorizeJSONDecisionContract(t *testing.T) {
 		{
 			name: "html navigation returns structured login redirect",
 			input: authorize.Request{
-				Method: http.MethodGet, Scheme: "https", Host: "points.shiguanglab.com", Path: "/ledger?limit=20",
+				Method: http.MethodGet, Scheme: "https", Host: "point.shiguanglab.com", Path: "/ledger?limit=20",
 				ProductID: "points-ui", Audience: "points-ui", Accept: "text/html",
 			},
 			wantStatus: http.StatusFound, wantReason: "session_missing", wantLocation: true,

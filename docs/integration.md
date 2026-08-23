@@ -189,7 +189,7 @@ auth-service 会校验 `Origin` 必须是第一方来源(你的产品域名需�
 (回跳地址的 origin 必须在 `ALLOWED_RETURN_ORIGINS`)。
 官网产品介绍页也使用同一个入口模型：介绍和展示留在 `shiguanglab.com`，
 登录成功后的工作台回到产品独立域名，例如
-`https://shiguanglab.com/login?return_to=https%3A%2F%2Fpoints.shiguanglab.com%2F`。
+`https://shiguanglab.com/login?return_to=https%3A%2F%2Fpoint.shiguanglab.com%2F`。
 
 **切换上下文后必须整页刷新**(或全量重拉数据):断言的 org_id 变了,
 所有已缓存的租户数据都作废。

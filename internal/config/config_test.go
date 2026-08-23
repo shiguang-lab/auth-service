@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-func TestDefaultAllowedReturnOriginsIncludePointsHost(t *testing.T) {
+func TestDefaultOriginsIncludeDeployedProductsAndRoleManagers(t *testing.T) {
 	t.Setenv("APP_ENV", "development")
 	t.Setenv("GATEWAY_SHARED_TOKEN", strings.Repeat("g", 32))
 	t.Setenv("SESSION_BACKEND", "memory")
@@ -20,10 +20,10 @@ func TestDefaultAllowedReturnOriginsIncludePointsHost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Contains(cfg.AllowedReturnOrigins, "https://points.shiguanglab.com") {
+	if !slices.Contains(cfg.AllowedReturnOrigins, "https://point.shiguanglab.com") || !slices.Contains(cfg.AllowedReturnOrigins, "https://skills.shiguanglab.com") {
 		t.Fatalf("allowed return origins = %#v", cfg.AllowedReturnOrigins)
 	}
-	if !slices.Equal(cfg.IAMRoleAdminOrigins, []string{"https://points.shiguanglab.com"}) {
+	if !slices.Equal(cfg.IAMRoleAdminOrigins, []string{"https://shiguanglab.com", "https://point.shiguanglab.com"}) {
 		t.Fatalf("IAM role admin origins = %#v", cfg.IAMRoleAdminOrigins)
 	}
 	if cfg.IAMRoleCommandTTL != 30*24*time.Hour || cfg.IAMRoleCommandPrefix != "auth:iam-role-command:" {
@@ -89,7 +89,7 @@ func TestProductionAcceptsRedisAndSigningKey(t *testing.T) {
 		OIDCClientID:               "client-id",
 		OIDCClientSecret:           "client-secret",
 		OIDCRedirectURL:            "https://shiguanglab.com/api/auth/oidc/callback",
-		IAMRoleAdminOrigins:        []string{"https://points.shiguanglab.com"},
+		IAMRoleAdminOrigins:        []string{"https://point.shiguanglab.com"},
 		IdentityIssuer:             "https://auth.shiguanglab.com",
 		SigningKeyFile:             "/run/secrets/identity.pem",
 		SigningKeyID:               "key-1",
@@ -128,7 +128,7 @@ func TestProductionRejectsUnsafeIAMRoleAdminOrigin(t *testing.T) {
 		IdentityTokenTTL:           time.Minute,
 		IdleTTL:                    time.Hour,
 		AbsoluteTTL:                24 * time.Hour,
-		IAMRoleAdminOrigins:        []string{"http://points.shiguanglab.com"},
+		IAMRoleAdminOrigins:        []string{"http://point.shiguanglab.com"},
 	}
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "IAM role admin origin") {
 		t.Fatalf("expected unsafe IAM role admin origin error, got %v", err)

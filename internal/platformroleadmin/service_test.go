@@ -15,7 +15,7 @@ import (
 	"github.com/shiguanglab/auth-service/internal/session"
 )
 
-const testRoleAdminOrigin = "https://points.shiguanglab.com"
+const testRoleAdminOrigin = "https://point.shiguanglab.com"
 
 type fakeResolver struct{ current session.Session }
 
@@ -227,7 +227,7 @@ func TestRoleManagementRejectsMissingAndSiblingOrigins(t *testing.T) {
 		directory, directory, &memoryAudit{}, []string{testRoleAdminOrigin}, nil,
 	)
 	handler := newHandler(service)
-	for _, origin := range []string{"", "https://huiguang.shiguanglab.com", "https://points.shiguanglab.com.evil.example"} {
+	for _, origin := range []string{"", "https://huiguang.shiguanglab.com", "https://point.shiguanglab.com.evil.example"} {
 		t.Run(origin, func(t *testing.T) {
 			response := serveWithOrigin(handler, http.MethodPut, "/api/auth/iam/points-role-assignments/target", `{"roles":["platform:points-admin"]}`, origin)
 			assertError(t, response, http.StatusForbidden, "invalid_origin")

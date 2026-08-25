@@ -14,11 +14,14 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/shiguanglab/auth-service/internal/config"
@@ -49,6 +52,7 @@ type directoryClient interface {
 	ListAuthorizations(context.Context, zitadel.AuthorizationFilter) ([]zitadel.Authorization, error)
 	GetUserByLoginName(context.Context, string) (zitadel.User, error)
 	SearchUsersByIDs(context.Context, []string) ([]zitadel.User, error)
+	SearchUsers(context.Context, string, int) ([]zitadel.User, error)
 }
 
 type sessionResolver interface {
@@ -56,12 +60,17 @@ type sessionResolver interface {
 }
 
 type Service struct {
-	cfg      config.Config
-	sessions session.Store
-	resolver sessionResolver
-	zitadel  directoryClient
-	logger   *slog.Logger
-	prepared bool
+	cfg          config.Config
+	sessions     session.Store
+	resolver     sessionResolver
+	zitadel      directoryClient
+	logger       *slog.Logger
+	prepared     bool
+	searchMu     sync.Mutex
+	searchWindow time.Time
+	searchCount  int
+	searchLimit  int
+	searchNow    func() time.Time
 }
 
 func NewService(cfg config.Config, sessions session.Store, resolver sessionResolver, directory directoryClient, logger *slog.Logger) *Service {
@@ -69,11 +78,13 @@ func NewService(cfg config.Config, sessions session.Store, resolver sessionResol
 		logger = slog.Default()
 	}
 	return &Service{
-		cfg:      cfg,
-		sessions: sessions,
-		resolver: resolver,
-		zitadel:  directory,
-		logger:   logger,
+		cfg:         cfg,
+		sessions:    sessions,
+		resolver:    resolver,
+		zitadel:     directory,
+		logger:      logger,
+		searchLimit: 30,
+		searchNow:   time.Now,
 	}
 }
 
@@ -224,6 +235,10 @@ func (s *Service) AddMemberHandler(response http.ResponseWriter, request *http.R
 			return
 		}
 		s.serverError(response, err)
+		return
+	}
+	if !activeUserState(user.State) {
+		writeJSON(response, http.StatusNotFound, map[string]string{"error": "user_not_found"})
 		return
 	}
 	if _, err := s.zitadel.CreateAuthorization(
@@ -377,6 +392,125 @@ func (s *Service) RequireIdentityAPIToken(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(response, request)
 	})
+}
+
+// RequirePointsIdentityServiceToken isolates the Points user picker from the
+// general product identity facade and all browser/gateway credentials.
+func (s *Service) RequirePointsIdentityServiceToken(next http.Handler) http.Handler {
+	expected := sha256.Sum256([]byte(s.cfg.PointsIdentityServiceToken))
+	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		token := strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
+		actual := sha256.Sum256([]byte(token))
+		if s.cfg.PointsIdentityServiceToken == "" || subtle.ConstantTimeCompare(expected[:], actual[:]) != 1 {
+			writeJSON(response, http.StatusUnauthorized, map[string]string{"error": "invalid_token"})
+			return
+		}
+		next.ServeHTTP(response, request)
+	})
+}
+
+func (s *Service) SearchUsersHandler(response http.ResponseWriter, request *http.Request) {
+	var input struct {
+		Query string `json:"query"`
+		Limit int    `json:"limit"`
+	}
+	if err := decodeJSON(request, &input); err != nil {
+		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	input.Query = strings.TrimSpace(input.Query)
+	queryLength := utf8.RuneCountInString(input.Query)
+	if queryLength < 3 || queryLength > 64 || input.Limit < 1 || input.Limit > 10 {
+		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	if !s.allowUserSearch() {
+		writeJSON(response, http.StatusTooManyRequests, map[string]string{"error": "rate_limited"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(request.Context(), 2*time.Second)
+	users, err := s.zitadel.SearchUsers(ctx, input.Query, input.Limit)
+	cancel()
+	if err != nil {
+		s.logger.Warn("points identity search unavailable", "error", err)
+		writeJSON(response, http.StatusServiceUnavailable, map[string]string{"error": "directory_unavailable"})
+		return
+	}
+	result := make([]map[string]any, 0, len(users))
+	for _, user := range users {
+		if !activeUserState(user.State) {
+			continue
+		}
+		result = append(result, map[string]any{
+			"id":          user.ID,
+			"loginName":   user.LoginName,
+			"displayName": user.DisplayName,
+			"state":       user.State,
+		})
+		if len(result) == input.Limit {
+			break
+		}
+	}
+	writeJSON(response, http.StatusOK, map[string]any{"users": result})
+}
+
+// ResolveUserHandler performs the exact ACTIVE-user check required after a
+// picker selection and before Points persists a new member reference.
+func (s *Service) ResolveUserHandler(response http.ResponseWriter, request *http.Request) {
+	var input struct {
+		UserID string `json:"userId"`
+	}
+	if err := decodeJSON(request, &input); err != nil {
+		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	input.UserID = strings.TrimSpace(input.UserID)
+	if input.UserID == "" || len(input.UserID) > 200 {
+		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	if !s.allowUserSearch() {
+		writeJSON(response, http.StatusTooManyRequests, map[string]string{"error": "rate_limited"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(request.Context(), 2*time.Second)
+	users, err := s.zitadel.SearchUsersByIDs(ctx, []string{input.UserID})
+	cancel()
+	if err != nil {
+		s.logger.Warn("points identity resolve unavailable", "error", err)
+		writeJSON(response, http.StatusServiceUnavailable, map[string]string{"error": "directory_unavailable"})
+		return
+	}
+	for _, user := range users {
+		if user.ID != input.UserID || !activeUserState(user.State) {
+			continue
+		}
+		writeJSON(response, http.StatusOK, map[string]any{"user": map[string]any{
+			"id":          user.ID,
+			"loginName":   user.LoginName,
+			"displayName": user.DisplayName,
+			"state":       user.State,
+		}})
+		return
+	}
+	writeJSON(response, http.StatusNotFound, map[string]string{"error": "user_not_found"})
+}
+
+func (s *Service) allowUserSearch() bool {
+	now := s.searchNow().UTC()
+	s.searchMu.Lock()
+	defer s.searchMu.Unlock()
+	if s.searchWindow.IsZero() || now.Sub(s.searchWindow) >= time.Minute || now.Before(s.searchWindow) {
+		s.searchWindow = now
+		s.searchCount = 0
+	}
+	if s.searchCount >= s.searchLimit {
+		return false
+	}
+	s.searchCount++
+	return true
 }
 
 func (s *Service) BatchGetUsersHandler(response http.ResponseWriter, request *http.Request) {
@@ -579,7 +713,17 @@ func containsRole(roles []string, role string) bool {
 func decodeJSON(request *http.Request, value any) error {
 	decoder := json.NewDecoder(http.MaxBytesReader(nil, request.Body, 16<<10))
 	decoder.DisallowUnknownFields()
-	return decoder.Decode(value)
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return errors.New("request body must contain exactly one JSON value")
+	}
+	return nil
+}
+
+func activeUserState(state string) bool {
+	return state == "USER_STATE_ACTIVE" || state == "STATE_ACTIVE"
 }
 
 func writeJSON(response http.ResponseWriter, status int, value any) {

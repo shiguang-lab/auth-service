@@ -84,6 +84,62 @@ func (s *RedisStore) Put(ctx context.Context, id string, value Session) error {
 	return nil
 }
 
+func (s *RedisStore) UpdatePlatformRoles(ctx context.Context, id, subject string, roles []string, refreshedAt time.Time) (Session, error) {
+	if id == "" || subject == "" {
+		return Session{}, ErrNotFound
+	}
+	key := s.key(id)
+	var updated Session
+	for range 3 {
+		err := s.client.Watch(ctx, func(tx *redis.Tx) error {
+			body, err := tx.Get(ctx, key).Bytes()
+			if errors.Is(err, redis.Nil) {
+				return ErrNotFound
+			}
+			if err != nil {
+				return fmt.Errorf("get session for platform role update: %w", err)
+			}
+			plaintext, err := s.codec.Open(body, key)
+			if err != nil {
+				return fmt.Errorf("decrypt session for platform role update: %w", err)
+			}
+			var value Session
+			if err := json.Unmarshal(plaintext, &value); err != nil {
+				return fmt.Errorf("decode session for platform role update: %w", err)
+			}
+			if value.Subject != subject {
+				return ErrNotFound
+			}
+			value.PlatformRoles = append([]string(nil), roles...)
+			value.PlatformRolesRefreshedAt = refreshedAt
+			plaintext, err = json.Marshal(value)
+			if err != nil {
+				return fmt.Errorf("encode session platform roles: %w", err)
+			}
+			body, err = s.codec.Seal(plaintext, key)
+			if err != nil {
+				return fmt.Errorf("encrypt session platform roles: %w", err)
+			}
+			if _, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.Set(ctx, key, body, redis.KeepTTL)
+				return nil
+			}); err != nil {
+				return err
+			}
+			updated = value
+			return nil
+		}, key)
+		if errors.Is(err, redis.TxFailedErr) {
+			continue
+		}
+		if err != nil {
+			return Session{}, err
+		}
+		return updated, nil
+	}
+	return Session{}, errors.New("update platform roles conflicted repeatedly")
+}
+
 func (s *RedisStore) Revoke(ctx context.Context, id string, at time.Time) error {
 	value, err := s.Get(ctx, id)
 	if err != nil {

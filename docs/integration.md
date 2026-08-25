@@ -153,6 +153,10 @@ NAS 内网(推荐,免公网回环)`http://auth-service:8081/.well-known/jwks.jso
 - `org:admin / org:member / org:viewer` —— 组织内角色,仅组织上下文出现;
 - `opc:system-admin`(OPC 系统管理员)等**平台角色**:与上下文无关,
   个人/组织断言中都存在;用于平台级资源(如内置 Agent 管理)的门禁;
+- `platform:points-admin / platform:points-auditor`分别对应积分平台管理和全局只读审计;
+  接入方管理员不是 IAM 全局角色,其唯一授权依据是 Points Service 中基于断言
+  `(issuer, sub)` 的 ACTIVE application membership。Auth Service 只提供可信身份,
+  不签发或推导应用成员关系;
 - 建议映射:个人上下文 = 本人全权;组织上下文按 org:* 收敛产品内角色。
 
 **租户建议**:用二元组做数据隔离键——
@@ -170,7 +174,6 @@ auth-service 会校验 `Origin` 必须是第一方来源(你的产品域名需�
 | 方法 | 路径 | 用途 | 成功响应(要点) |
 |---|---|---|---|
 | GET | `/api/auth/session` | 会话回显 | `{authenticated, subject, displayName, email, organization:{id,name}\|null, roles, platformRoles, entitlements}` |
-| GET | `/api/account/profile` | 当前用户权威资料(ZITADEL) | `{id,loginName,displayName,givenName,familyName,nickName,preferredLanguage,gender,email,emailVerified,phone,phoneVerified,state}` |
 | POST | `/api/auth/context` | 切换上下文,body `{organizationId}`(空串=个人) | `{organization, roles}`;非成员 404 |
 | POST | `/api/auth/logout` | 统一登出(清共享 cookie + 吊销上游会话) | `{redirect}` |
 | GET | `/api/account/orgs` | 我的组织列表 | `{organizations:[{id,name,roles}]}` |
@@ -184,6 +187,9 @@ auth-service 会校验 `Origin` 必须是第一方来源(你的产品域名需�
 `/api/auth/federated/*`)只在主站 `shiguanglab.com` 提供,产品域**不要**代理它们;
 产品未登录时跳 `https://shiguanglab.com/login?return_to=<回跳地址>`
 (回跳地址的 origin 必须在 `ALLOWED_RETURN_ORIGINS`)。
+官网产品介绍页也使用同一个入口模型：介绍和展示留在 `shiguanglab.com`，
+登录成功后的工作台回到产品独立域名，例如
+`https://shiguanglab.com/login?return_to=https%3A%2F%2Fpoint.shiguanglab.com%2F`。
 
 **切换上下文后必须整页刷新**(或全量重拉数据):断言的 org_id 变了,
 所有已缓存的租户数据都作废。
@@ -207,6 +213,22 @@ GET  /v1/identity/orgs/{orgId}/members     Authorization: Bearer <IDENTITY_API_T
 用法约束:结果做短 TTL 缓存;解析不到的 `sub` 显示「已注销用户」;
 **不要**把 displayName 写进业务表(PIPL 删除义务要求 PII 集中在 IAM 单点)。
 
+积分系统的选人器使用独立的 `POINTS_IDENTITY_SERVICE_TOKEN`，只允许
+Points BFF/服务端 secret store 持有，Points Web 和浏览器不得持有或直连：
+
+```text
+POST /v1/identity/users/search             Authorization: Bearer <POINTS_IDENTITY_SERVICE_TOKEN>
+  body: {"query":"alice","limit":10}       # query trim 后 3..64 字符，limit 1..10
+  -> {"users":[{id,loginName,displayName,state}]}  # 仅 ACTIVE，无 email
+
+POST /v1/identity/users/resolve            Authorization: Bearer <POINTS_IDENTITY_SERVICE_TOKEN>
+  body: {"userId":"<exact-zitadel-sub>"}
+  -> {"user":{id,loginName,displayName,state}}     # 仅精确 ACTIVE；否则 404
+```
+
+新增成员必须先 search 供用户选择，再由 Points 服务端在落库前 resolve
+精确复核。目录不可用返回 503 并停止写入；不得用模糊搜索结果直接创建成员。
+
 ---
 
 ## 7. 本地开发
@@ -225,7 +247,8 @@ GET  /v1/identity/orgs/{orgId}/members     Authorization: Bearer <IDENTITY_API_T
 
 需要 localhost API 使用真实生产账号、但不把凭据或共享 cookie 交给浏览器时，
 可由平台为指定产品开启 Local Broker。该能力只接受真实账号密码，不接受 subject，
-并在服务端固定 product、audience、required entitlement：
+并在服务端白名单中固定 product、audience、required entitlement。客户端只能选择
+白名单中的 productId，Broker 创建后不能切换产品：
 
 ```text
 localhost Node proxy --账号密码--> POST /api/auth/local-broker
@@ -239,9 +262,7 @@ localhost browser --> Node proxy --X-SG-Identity--> localhost product API
 
 ```dotenv
 LOCAL_BROKER_ENABLED=true
-LOCAL_BROKER_PRODUCT_ID=asset-hub
-LOCAL_BROKER_AUDIENCE=asset-hub-api
-LOCAL_BROKER_REQUIRED_ENTITLEMENTS=asset-hub:access
+LOCAL_BROKER_POLICIES=[{"productId":"asset-hub","audience":"asset-hub-api","requiredEntitlements":["asset-hub:access"]},{"productId":"opc","audience":"superagents-bff","requiredEntitlements":["superagents:access"]}]
 LOCAL_BROKER_TTL=12h
 DEFAULT_ENTITLEMENTS=superagents:access,asset-hub:access
 ```

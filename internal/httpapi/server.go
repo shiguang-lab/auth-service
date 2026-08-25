@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -16,27 +17,33 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/shiguanglab/auth-service/internal/authorize"
 	"github.com/shiguanglab/auth-service/internal/identity"
+	"github.com/shiguanglab/auth-service/internal/localidentity"
 	loginservice "github.com/shiguanglab/auth-service/internal/login"
 	orgservice "github.com/shiguanglab/auth-service/internal/orgs"
+	"github.com/shiguanglab/auth-service/internal/platformroleadmin"
 	"github.com/shiguanglab/auth-service/internal/session"
 )
 
 const (
-	gatewayTokenHeader = "X-SG-Gateway-Token"
-	identityHeader     = "X-SG-Identity"
+	gatewayTokenHeader       = "X-SG-Gateway-Token"
+	identityHeader           = "X-SG-Identity"
+	maxAuthorizeRequestBytes = 64 << 10
 )
 
 type ReadinessCheck func(context.Context) error
 
 type Server struct {
-	decision     *authorize.Service
-	signer       *identity.Signer
-	gatewayToken [32]byte
-	readiness    ReadinessCheck
-	logger       *slog.Logger
-	login        *loginservice.Service
-	orgs         *orgservice.Service
-	localBroker  *LocalBrokerPolicy
+	decision         *authorize.Service
+	signer           *identity.Signer
+	gatewayToken     [32]byte
+	readiness        ReadinessCheck
+	logger           *slog.Logger
+	login            *loginservice.Service
+	orgs             *orgservice.Service
+	roleAdmin        *platformroleadmin.Service
+	productRoleAdmin *platformroleadmin.Service
+	localIdentity    *localidentity.Service
+	localBrokers     map[string]LocalBrokerPolicy
 }
 
 type LocalBrokerPolicy struct {
@@ -48,16 +55,36 @@ type LocalBrokerPolicy struct {
 	IdentityTTL          time.Duration
 }
 
-// WithOrganizations attaches the organization domain service. Routes are only
-// mounted when both the login service and this service are configured.
-func (s *Server) WithOrganizations(orgs *orgservice.Service) *Server {
-	s.orgs = orgs
+func (s *Server) WithLocalIdentity(service *localidentity.Service) *Server {
+	s.localIdentity = service
 	return s
 }
 
 func (s *Server) WithLocalBroker(policy LocalBrokerPolicy) *Server {
 	policy.RequiredEntitlements = append([]string(nil), policy.RequiredEntitlements...)
-	s.localBroker = &policy
+	if s.localBrokers == nil {
+		s.localBrokers = make(map[string]LocalBrokerPolicy)
+	}
+	s.localBrokers[policy.ProductID] = policy
+	return s
+}
+
+// WithPlatformRoleAdmin mounts the narrowly-scoped Points IAM role API. The
+// service itself remains fail-closed when no production writer is configured.
+func (s *Server) WithPlatformRoleAdmin(service *platformroleadmin.Service) *Server {
+	s.roleAdmin = service
+	return s
+}
+
+func (s *Server) WithProductRoleAdmin(service *platformroleadmin.Service) *Server {
+	s.productRoleAdmin = service
+	return s
+}
+
+// WithOrganizations attaches the organization domain service. Routes are only
+// mounted when both the login service and this service are configured.
+func (s *Server) WithOrganizations(orgs *orgservice.Service) *Server {
+	s.orgs = orgs
 	return s
 }
 
@@ -96,6 +123,32 @@ func (s *Server) Handler() http.Handler {
 	router.Get("/health/ready", s.handleReady)
 	router.Get("/.well-known/jwks.json", s.handleJWKS)
 	router.With(s.authenticateGateway).Get("/v1/forward-auth", s.handleForwardAuth)
+	router.With(s.authenticateGateway).Post("/v1/authorize", s.handleAuthorize)
+	if s.localIdentity != nil {
+		router.Group(func(local chi.Router) {
+			local.Use(s.authenticateGateway)
+			local.Get("/login", s.localIdentity.LoginPage)
+			local.Post("/api/auth/local/login", s.localIdentity.Login)
+			local.Get("/api/auth/session", s.localIdentity.Session)
+			local.Post("/api/auth/logout", s.localIdentity.Logout)
+			if s.roleAdmin != nil {
+				local.Post("/api/auth/iam/points-role-assignments/search", s.roleAdmin.SearchHandler)
+				local.Post("/api/auth/iam/points-role-assignments/resolve", s.roleAdmin.ResolveHandler)
+				local.Put("/api/auth/iam/points-role-assignments/{userID}", s.roleAdmin.UpdateHandler)
+			}
+			if s.productRoleAdmin != nil {
+				local.Get("/api/auth/portal/access", s.productRoleAdmin.PortalAccessHandler)
+				local.Post("/api/auth/iam/product-role-assignments/search", s.productRoleAdmin.SearchHandler)
+				local.Post("/api/auth/iam/product-role-assignments/resolve", s.productRoleAdmin.ResolveHandler)
+				local.Put("/api/auth/iam/product-role-assignments/{userID}", s.productRoleAdmin.UpdateHandler)
+			}
+			local.Post("/api/auth/local/provider/fail-next", s.localIdentity.FailNextProviderWrite)
+			local.Get("/api/auth/local/iam-commands", s.localIdentity.ListCommands)
+			local.Post("/api/auth/local/iam-commands/{operationID}/retry", s.localIdentity.RetryCommand)
+		})
+		router.Post("/v1/identity/users/search", s.localIdentity.SearchIdentityUsers)
+		router.Post("/v1/identity/users/resolve", s.localIdentity.ResolveIdentityUser)
+	}
 	if s.login != nil {
 		router.Group(func(auth chi.Router) {
 			auth.Use(s.authenticateGateway)
@@ -105,9 +158,6 @@ func (s *Server) Handler() http.Handler {
 			auth.Get("/api/auth/federated/start", s.login.Start)
 			auth.Post("/api/auth/login/context", s.login.Context)
 			auth.Post("/api/auth/login/password", s.login.Password)
-			auth.Post("/api/auth/login/email/code", s.login.SendEmailCode)
-			auth.Post("/api/auth/login/email/verify", s.login.VerifyEmailCode)
-			auth.Get("/api/auth/login/email/callback", s.login.EmailCodeCallback)
 			auth.Post("/api/auth/register/context", s.login.RegistrationContext)
 			auth.Post("/api/auth/register", s.login.Register)
 			auth.Get("/api/auth/register/provider", s.login.Start)
@@ -122,9 +172,20 @@ func (s *Server) Handler() http.Handler {
 			auth.Patch("/api/account/profile", s.login.UpdateProfile)
 			auth.Post("/api/account/avatar", s.login.UploadAvatar)
 			auth.Post("/api/auth/logout", s.login.Logout)
-			if s.localBroker != nil {
+			if len(s.localBrokers) > 0 {
 				auth.Post("/api/auth/local-broker", s.handleLocalBrokerLogin)
 				auth.Post("/api/auth/local-broker/refresh", s.handleLocalBrokerRefresh)
+			}
+			if s.roleAdmin != nil {
+				auth.Post("/api/auth/iam/points-role-assignments/search", s.roleAdmin.SearchHandler)
+				auth.Post("/api/auth/iam/points-role-assignments/resolve", s.roleAdmin.ResolveHandler)
+				auth.Put("/api/auth/iam/points-role-assignments/{userID}", s.roleAdmin.UpdateHandler)
+			}
+			if s.productRoleAdmin != nil {
+				auth.Get("/api/auth/portal/access", s.productRoleAdmin.PortalAccessHandler)
+				auth.Post("/api/auth/iam/product-role-assignments/search", s.productRoleAdmin.SearchHandler)
+				auth.Post("/api/auth/iam/product-role-assignments/resolve", s.productRoleAdmin.ResolveHandler)
+				auth.Put("/api/auth/iam/product-role-assignments/{userID}", s.productRoleAdmin.UpdateHandler)
 			}
 			if s.orgs != nil {
 				auth.Post("/api/auth/context", s.orgs.SwitchContextHandler)
@@ -138,6 +199,11 @@ func (s *Server) Handler() http.Handler {
 		})
 	}
 	if s.orgs != nil {
+		router.Group(func(pointsIdentity chi.Router) {
+			pointsIdentity.Use(s.orgs.RequirePointsIdentityServiceToken)
+			pointsIdentity.Post("/v1/identity/users/search", s.orgs.SearchUsersHandler)
+			pointsIdentity.Post("/v1/identity/users/resolve", s.orgs.ResolveUserHandler)
+		})
 		router.Group(func(identityAPI chi.Router) {
 			identityAPI.Use(s.orgs.RequireIdentityAPIToken)
 			identityAPI.Post("/v1/identity/users/batch-get", s.orgs.BatchGetUsersHandler)
@@ -155,9 +221,19 @@ func (s *Server) handleLocalBrokerLogin(response http.ResponseWriter, request *h
 	var input struct {
 		LoginName string `json:"loginName"`
 		Password  string `json:"password"`
+		ProductID string `json:"productId"`
 	}
 	if err := decodeBrokerJSON(response, request, &input); err != nil {
 		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	policy, ok := s.localBrokers[strings.TrimSpace(input.ProductID)]
+	if !ok {
+		writeJSON(response, http.StatusForbidden, map[string]string{"error": "invalid_product"})
+		return
+	}
+	if request.Header.Get("Origin") != policy.PublicOrigin {
+		writeJSON(response, http.StatusForbidden, map[string]string{"error": "invalid_origin"})
 		return
 	}
 	brokerToken, value, err := s.login.CreateLocalBroker(
@@ -165,7 +241,8 @@ func (s *Server) handleLocalBrokerLogin(response http.ResponseWriter, request *h
 		brokerClientKey(request),
 		input.LoginName,
 		input.Password,
-		s.localBroker.BrokerTTL,
+		policy.ProductID,
+		policy.BrokerTTL,
 	)
 	if err != nil {
 		switch {
@@ -179,7 +256,7 @@ func (s *Server) handleLocalBrokerLogin(response http.ResponseWriter, request *h
 		}
 		return
 	}
-	s.writeLocalBrokerResponse(response, request, brokerToken, value)
+	s.writeLocalBrokerResponse(response, request, brokerToken, value, policy)
 }
 
 func (s *Server) handleLocalBrokerRefresh(response http.ResponseWriter, request *http.Request) {
@@ -193,7 +270,16 @@ func (s *Server) handleLocalBrokerRefresh(response http.ResponseWriter, request 
 		writeJSON(response, http.StatusUnauthorized, map[string]string{"error": "broker_invalid"})
 		return
 	}
-	s.writeLocalBrokerResponse(response, request, brokerToken, value)
+	policy, ok := s.localBrokers[value.BrokerProductID]
+	if !ok {
+		writeJSON(response, http.StatusUnauthorized, map[string]string{"error": "broker_invalid"})
+		return
+	}
+	if request.Header.Get("Origin") != policy.PublicOrigin {
+		writeJSON(response, http.StatusForbidden, map[string]string{"error": "invalid_origin"})
+		return
+	}
+	s.writeLocalBrokerResponse(response, request, brokerToken, value, policy)
 }
 
 func (s *Server) writeLocalBrokerResponse(
@@ -201,8 +287,8 @@ func (s *Server) writeLocalBrokerResponse(
 	request *http.Request,
 	brokerToken string,
 	value session.Session,
+	policy LocalBrokerPolicy,
 ) {
-	policy := s.localBroker
 	decision := s.decision.DecideBroker(request.Context(), brokerToken, authorize.Request{
 		ProductID:            policy.ProductID,
 		Audience:             policy.Audience,
@@ -237,13 +323,25 @@ func (s *Server) writeLocalBrokerResponse(
 }
 
 func (s *Server) validLocalBrokerOrigin(request *http.Request) bool {
-	return s.localBroker != nil && request.Header.Get("Origin") == s.localBroker.PublicOrigin
+	origin := request.Header.Get("Origin")
+	for _, policy := range s.localBrokers {
+		if origin == policy.PublicOrigin {
+			return true
+		}
+	}
+	return false
 }
 
 func decodeBrokerJSON(response http.ResponseWriter, request *http.Request, value any) error {
 	decoder := json.NewDecoder(http.MaxBytesReader(response, request.Body, 4<<10))
 	decoder.DisallowUnknownFields()
-	return decoder.Decode(value)
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("one JSON value is required")
+	}
+	return nil
 }
 
 func brokerClientKey(request *http.Request) string {
@@ -277,7 +375,44 @@ func (s *Server) handleForwardAuth(response http.ResponseWriter, request *http.R
 		Audience:             request.Header.Get("X-SG-Audience"),
 		RequiredEntitlements: splitCSV(request.Header.Get("X-SG-Required-Entitlements")),
 	}
-	decision := s.decision.Decide(request.Context(), input)
+	decision := s.decide(request.Context(), input)
+
+	for _, cookie := range decision.SetCookies {
+		response.Header().Add("Set-Cookie", cookie)
+	}
+	if decision.Location != "" {
+		response.Header().Set("Location", decision.Location)
+	}
+	if decision.Allow {
+		response.Header().Set(identityHeader, decision.IdentityToken)
+		response.WriteHeader(http.StatusOK)
+		return
+	}
+	writeJSON(response, decision.Status, map[string]string{"error": decision.Reason})
+}
+
+func (s *Server) handleAuthorize(response http.ResponseWriter, request *http.Request) {
+	request.Body = http.MaxBytesReader(response, request.Body, maxAuthorizeRequestBytes)
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+
+	var input authorize.Request
+	if err := decoder.Decode(&input); err != nil {
+		s.writeInvalidAuthorizeRequest(response, err)
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		s.writeInvalidAuthorizeRequest(response, err)
+		return
+	}
+	if input.RequestID == "" {
+		input.RequestID = middleware.GetReqID(request.Context())
+	}
+	writeJSON(response, http.StatusOK, s.decide(request.Context(), input))
+}
+
+func (s *Server) decide(ctx context.Context, input authorize.Request) authorize.Response {
+	decision := s.decision.Decide(ctx, input)
 	if !decision.Allow &&
 		decision.Status == http.StatusUnauthorized &&
 		(input.Method == http.MethodGet || input.Method == http.MethodHead) &&
@@ -302,19 +437,20 @@ func (s *Server) handleForwardAuth(response http.ResponseWriter, request *http.R
 		"status", decision.Status,
 		"reason", decision.Reason,
 	)
+	return decision
+}
 
-	for _, cookie := range decision.SetCookies {
-		response.Header().Add("Set-Cookie", cookie)
+func (s *Server) writeInvalidAuthorizeRequest(response http.ResponseWriter, err error) {
+	status := http.StatusBadRequest
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		status = http.StatusRequestEntityTooLarge
 	}
-	if decision.Location != "" {
-		response.Header().Set("Location", decision.Location)
-	}
-	if decision.Allow {
-		response.Header().Set(identityHeader, decision.IdentityToken)
-		response.WriteHeader(http.StatusOK)
-		return
-	}
-	writeJSON(response, decision.Status, map[string]string{"error": decision.Reason})
+	writeJSON(response, status, authorize.Response{
+		Allow:  false,
+		Status: status,
+		Reason: "invalid_request",
+	})
 }
 
 func (s *Server) handleReady(response http.ResponseWriter, request *http.Request) {

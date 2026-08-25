@@ -49,17 +49,27 @@ var (
 )
 
 type Service struct {
-	cfg          config.Config
-	sessions     session.Store
-	transactions transactionRepository
-	zitadel      zitadelSessionClient
-	oidcMu       sync.Mutex
-	oidcHTTP     *http.Client
-	oauth        oauth2.Config
-	verifier     *oidc.IDTokenVerifier
-	providerHTTP *http.Client
-	feishuURLs   feishuEndpoints
-	logger       *slog.Logger
+	cfg           config.Config
+	sessions      session.Store
+	transactions  transactionRepository
+	zitadel       zitadelSessionClient
+	oidcMu        sync.Mutex
+	oidcHTTP      *http.Client
+	oauth         oauth2.Config
+	verifier      *oidc.IDTokenVerifier
+	providerHTTP  *http.Client
+	feishuURLs    feishuEndpoints
+	logger        *slog.Logger
+	roleRefresher platformRoleRefresher
+}
+
+type platformRoleRefresher interface {
+	Refresh(context.Context, string, session.Session) (session.Session, error)
+}
+
+func (s *Service) WithPlatformRoleRefresher(refresher platformRoleRefresher) *Service {
+	s.roleRefresher = refresher
+	return s
 }
 
 type feishuEndpoints struct {
@@ -750,10 +760,12 @@ func (s *Service) CreateLocalBroker(
 	clientKey string,
 	loginName string,
 	password string,
+	productID string,
 	ttl time.Duration,
 ) (string, session.Session, error) {
 	loginName = strings.TrimSpace(loginName)
-	if loginName == "" || password == "" || len(loginName) > 320 || len(password) > 1024 {
+	productID = strings.TrimSpace(productID)
+	if loginName == "" || password == "" || productID == "" || len(loginName) > 320 || len(password) > 1024 {
 		return "", session.Session{}, ErrBrokerInvalidCredentials
 	}
 	allowed, err := s.transactions.allowAttempt(
@@ -798,6 +810,7 @@ func (s *Service) CreateLocalBroker(
 		LastSeenAt:            now,
 		CredentialKind:        session.CredentialKindLocalBroker,
 		CredentialExpiresAt:   now.Add(ttl),
+		BrokerProductID:       productID,
 	}
 	if value.Subject == "" {
 		_ = s.zitadel.DeleteSession(ctx, upstreamSession.ID, upstreamSession.Token)
@@ -815,11 +828,20 @@ func (s *Service) ResolveLocalBroker(ctx context.Context, brokerToken string) (s
 	if err != nil {
 		return session.Session{}, err
 	}
+	now := time.Now().UTC()
 	if value.CredentialKind != session.CredentialKindLocalBroker ||
 		value.Subject == "" ||
+		value.BrokerProductID == "" ||
 		value.CredentialExpiresAt.IsZero() ||
-		!time.Now().UTC().Before(value.CredentialExpiresAt) {
+		!now.Before(value.CredentialExpiresAt) ||
+		!value.RevokedAt.IsZero() {
 		return session.Session{}, session.ErrNotFound
+	}
+	if s.roleRefresher != nil {
+		value, err = s.roleRefresher.Refresh(ctx, brokerToken, value)
+		if err != nil {
+			return session.Session{}, err
+		}
 	}
 	return value, nil
 }
@@ -1799,10 +1821,19 @@ func (s *Service) currentSession(request *http.Request) (session.Session, string
 	if err != nil {
 		return session.Session{}, "", err
 	}
+	now := time.Now().UTC()
+	if s.roleRefresher != nil {
+		value, err = s.roleRefresher.Refresh(request.Context(), cookie.Value, value)
+		if err != nil {
+			return session.Session{}, "", err
+		}
+		if !value.RevokedAt.IsZero() || now.Sub(value.LastSeenAt) > s.cfg.IdleTTL || now.Sub(value.CreatedAt) > s.cfg.AbsoluteTTL {
+			return session.Session{}, "", session.ErrNotFound
+		}
+	}
 	if value.CredentialKind == session.CredentialKindLocalBroker {
 		return session.Session{}, "", session.ErrNotFound
 	}
-	now := time.Now().UTC()
 	if !value.RevokedAt.IsZero() || now.Sub(value.LastSeenAt) > s.cfg.IdleTTL || now.Sub(value.CreatedAt) > s.cfg.AbsoluteTTL {
 		return session.Session{}, "", session.ErrNotFound
 	}

@@ -16,8 +16,11 @@ import (
 	"github.com/shiguanglab/auth-service/internal/config"
 	"github.com/shiguanglab/auth-service/internal/httpapi"
 	"github.com/shiguanglab/auth-service/internal/identity"
+	"github.com/shiguanglab/auth-service/internal/localidentity"
 	loginservice "github.com/shiguanglab/auth-service/internal/login"
 	orgservice "github.com/shiguanglab/auth-service/internal/orgs"
+	"github.com/shiguanglab/auth-service/internal/platformroleadmin"
+	"github.com/shiguanglab/auth-service/internal/platformroles"
 	"github.com/shiguanglab/auth-service/internal/session"
 	"github.com/shiguanglab/auth-service/internal/zitadel"
 )
@@ -49,6 +52,19 @@ func main() {
 			logger.Error("close session store", "error", err)
 		}
 	}()
+	var roleCommandJournal *platformroleadmin.RedisCommandJournal
+	if cfg.SessionBackend == "redis" {
+		roleCommandJournal, err = platformroleadmin.NewRedisCommandJournal(redisOptions, cfg.IAMRoleCommandPrefix, cfg.SessionEncryptionKey)
+		if err != nil {
+			logger.Error("initialize IAM role command journal", "error", err)
+			os.Exit(1)
+		}
+		defer func() {
+			if err := roleCommandJournal.Close(); err != nil {
+				logger.Error("close IAM role command journal", "error", err)
+			}
+		}()
+	}
 	startupContext, cancelStartup := context.WithTimeout(context.Background(), 20*time.Second)
 	login, err := loginservice.NewService(startupContext, cfg, store, redisOptions, logger)
 	cancelStartup()
@@ -57,31 +73,60 @@ func main() {
 		os.Exit(1)
 	}
 	defer func() {
-		if err := login.Close(); err != nil {
-			logger.Error("close login service", "error", err)
+		if login != nil {
+			if err := login.Close(); err != nil {
+				logger.Error("close login service", "error", err)
+			}
 		}
 	}()
 
-	decision := authorize.NewService(store, signer, cfg.SessionCookieName, cfg.IdleTTL, cfg.AbsoluteTTL)
-	readiness := func(ctx context.Context) error {
-		if err := store.Ping(ctx); err != nil {
-			return err
+	var localFixture *localidentity.Service
+	var localExecutor *platformroleadmin.DurableChangeExecutor
+	if cfg.LocalIdentityFixture {
+		localFixture, err = localidentity.New(localidentity.Config{
+			Origin:         cfg.LocalIdentityOrigin,
+			CookieName:     cfg.SessionCookieName,
+			CookieTTL:      cfg.AbsoluteTTL,
+			IdentityIssuer: cfg.IdentityIssuer,
+			IdentityToken:  cfg.LocalIdentityServiceToken,
+			RedisPrefix:    cfg.LocalIdentityRedisPrefix,
+		}, store, redisOptions, logger)
+		if err != nil {
+			logger.Error("initialize local identity fixture", "error", err)
+			os.Exit(1)
 		}
-		return login.Ping(ctx)
+		defer func() {
+			if err := localFixture.Close(); err != nil {
+				logger.Error("close local identity fixture", "error", err)
+			}
+		}()
+		if roleCommandJournal == nil {
+			logger.Error("local identity fixture requires IAM command journal")
+			os.Exit(1)
+		}
+		localExecutor, err = platformroleadmin.NewDurableChangeExecutor(roleCommandJournal, localFixture, cfg.IAMRoleCommandTTL, 10*time.Second)
+		if err != nil {
+			logger.Error("initialize local IAM role executor", "error", err)
+			os.Exit(1)
+		}
+		localFixture.SetExecutor(localExecutor)
+		seedContext, cancelSeed := context.WithTimeout(context.Background(), 5*time.Second)
+		err = localFixture.Seed(seedContext)
+		cancelSeed()
+		if err != nil {
+			logger.Error("seed local identity fixture", "error", err)
+			os.Exit(1)
+		}
 	}
-	api := httpapi.NewServer(decision, signer, cfg.GatewayToken, readiness, logger, login)
-	if cfg.LocalBrokerEnabled {
-		api.WithLocalBroker(httpapi.LocalBrokerPolicy{
-			PublicOrigin:         cfg.PublicOrigin,
-			ProductID:            cfg.LocalBrokerProductID,
-			Audience:             cfg.LocalBrokerAudience,
-			RequiredEntitlements: cfg.LocalBrokerEntitlements,
-			BrokerTTL:            cfg.LocalBrokerTTL,
-			IdentityTTL:          cfg.IdentityTokenTTL,
-		})
+
+	decision := authorize.NewService(store, signer, cfg.SessionCookieName, cfg.IdleTTL, cfg.AbsoluteTTL)
+	if localFixture != nil {
+		decision.WithPlatformRoleRefresher(localFixture)
 	}
+	var directory *zitadel.Client
+	var roleDirectory platformroleadmin.Directory
 	if login != nil && cfg.ZitadelProjectID != "" {
-		directory, err := zitadel.NewClient(
+		directory, err = zitadel.NewClient(
 			cfg.ZitadelInternalURL,
 			cfg.ZitadelIssuer,
 			cfg.ZitadelPATFile,
@@ -89,9 +134,57 @@ func main() {
 			cfg.ZitadelOrganizationID,
 		)
 		if err != nil {
-			logger.Error("initialize organization directory client", "error", err)
+			logger.Error("initialize platform directory client", "error", err)
 			os.Exit(1)
 		}
+		roleDirectory = platformroleadmin.NewZitadelDirectory(directory, cfg.ZitadelOrganizationID, cfg.ZitadelProjectID)
+		roleRefresher := platformroles.New(store, directory, cfg.ZitadelOrganizationID, cfg.ZitadelProjectID, logger)
+		login.WithPlatformRoleRefresher(roleRefresher)
+		decision.WithPlatformRoleRefresher(roleRefresher)
+	}
+	readiness := func(ctx context.Context) error {
+		if err := store.Ping(ctx); err != nil {
+			return err
+		}
+		if login != nil {
+			if err := login.Ping(ctx); err != nil {
+				return err
+			}
+		}
+		if localFixture != nil {
+			if err := localFixture.Ping(ctx); err != nil {
+				return err
+			}
+		}
+		if roleCommandJournal != nil {
+			return roleCommandJournal.Ping(ctx)
+		}
+		return nil
+	}
+	api := httpapi.NewServer(decision, signer, cfg.GatewayToken, readiness, logger, login)
+	if cfg.LocalBrokerEnabled {
+		for _, policy := range cfg.EffectiveLocalBrokerPolicies() {
+			api.WithLocalBroker(httpapi.LocalBrokerPolicy{
+				PublicOrigin:         cfg.PublicOrigin,
+				ProductID:            policy.ProductID,
+				Audience:             policy.Audience,
+				RequiredEntitlements: policy.RequiredEntitlements,
+				BrokerTTL:            cfg.LocalBrokerTTL,
+				IdentityTTL:          cfg.IdentityTokenTTL,
+			})
+		}
+	}
+	if localFixture != nil {
+		api.WithLocalIdentity(localFixture)
+		api.WithPlatformRoleAdmin(platformroleadmin.NewService(localFixture, localFixture, localExecutor, localFixture, cfg.IAMRoleAdminOrigins, logger))
+		api.WithProductRoleAdmin(platformroleadmin.NewProductService(localFixture, localFixture, localExecutor, localFixture, cfg.IAMRoleAdminOrigins, logger))
+	} else if login != nil {
+		// The Redis command journal is ready when configured, but the executor
+		// remains nil until a ZITADEL writer and permanent audit sink are approved.
+		api.WithPlatformRoleAdmin(platformroleadmin.NewService(login, roleDirectory, nil, nil, cfg.IAMRoleAdminOrigins, logger))
+		api.WithProductRoleAdmin(platformroleadmin.NewProductService(login, roleDirectory, nil, nil, cfg.IAMRoleAdminOrigins, logger))
+	}
+	if directory != nil {
 		api.WithOrganizations(orgservice.NewService(cfg, store, login, directory, logger))
 	}
 	server := &http.Server{

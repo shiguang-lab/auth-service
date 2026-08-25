@@ -2,8 +2,10 @@ package config
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"regexp"
@@ -11,7 +13,16 @@ import (
 	"time"
 )
 
-var providerTokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+var (
+	providerTokenPattern    = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+	entitlementTokenPattern = regexp.MustCompile(`^[A-Za-z0-9_:-]+$`)
+)
+
+type LocalBrokerProductPolicy struct {
+	ProductID            string   `json:"productId"`
+	Audience             string   `json:"audience"`
+	RequiredEntitlements []string `json:"requiredEntitlements"`
+}
 
 type Config struct {
 	// S3Endpoint is the MinIO/S3-compatible endpoint (host:port).
@@ -43,12 +54,20 @@ type Config struct {
 	ZitadelOrganizationID      string
 	ZitadelProjectID           string
 	IdentityAPIToken           string
+	PointsIdentityServiceToken string
 	OIDCClientID               string
 	OIDCClientSecret           string
 	OIDCRedirectURL            string
 	OIDCProviderIDs            map[string]string
 	FeishuAppID                string
 	AllowedReturnOrigins       []string
+	IAMRoleAdminOrigins        []string
+	IAMRoleCommandPrefix       string
+	IAMRoleCommandTTL          time.Duration
+	LocalIdentityFixture       bool
+	LocalIdentityOrigin        string
+	LocalIdentityServiceToken  string
+	LocalIdentityRedisPrefix   string
 	DefaultEntitlements        []string
 	IdentityIssuer             string
 	SigningKeyFile             string
@@ -60,6 +79,7 @@ type Config struct {
 	LocalBrokerProductID       string
 	LocalBrokerAudience        string
 	LocalBrokerEntitlements    []string
+	LocalBrokerPolicies        []LocalBrokerProductPolicy
 	LocalBrokerTTL             time.Duration
 }
 
@@ -76,6 +96,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	iamRoleCommandTTL, err := durationOr("IAM_ROLE_COMMAND_TTL", 30*24*time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
 	localBrokerTTL, err := durationOr("LOCAL_BROKER_TTL", 12*time.Hour)
 	if err != nil {
 		return Config{}, err
@@ -89,6 +113,10 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if err := addProviderID(providerIDs, "feishu", os.Getenv("FEISHU_IDP_ID")); err != nil {
+		return Config{}, err
+	}
+	localBrokerPolicies, err := parseLocalBrokerPolicies(os.Getenv("LOCAL_BROKER_POLICIES"))
+	if err != nil {
 		return Config{}, err
 	}
 
@@ -110,13 +138,21 @@ func Load() (Config, error) {
 		ZitadelOrganizationID:      strings.TrimSpace(os.Getenv("ZITADEL_ORGANIZATION_ID")),
 		ZitadelProjectID:           strings.TrimSpace(os.Getenv("ZITADEL_PROJECT_ID")),
 		IdentityAPIToken:           strings.TrimSpace(os.Getenv("IDENTITY_API_TOKEN")),
+		PointsIdentityServiceToken: strings.TrimSpace(os.Getenv("POINTS_IDENTITY_SERVICE_TOKEN")),
 		OIDCClientID:               strings.TrimSpace(os.Getenv("OIDC_CLIENT_ID")),
 		OIDCClientSecret:           strings.TrimSpace(os.Getenv("OIDC_CLIENT_SECRET")),
 		OIDCRedirectURL:            envOr("OIDC_REDIRECT_URL", "https://shiguanglab.com/api/auth/oidc/callback"),
 		OIDCProviderIDs:            providerIDs,
 		FeishuAppID:                strings.TrimSpace(os.Getenv("FEISHU_APP_ID")),
-		AllowedReturnOrigins:       splitCSV(envOr("ALLOWED_RETURN_ORIGINS", "https://shiguanglab.com,https://www.shiguanglab.com,https://opc.shiguanglab.com")),
-		DefaultEntitlements:        splitCSV(envOr("DEFAULT_ENTITLEMENTS", "superagents:access")),
+		AllowedReturnOrigins:       splitCSV(envOr("ALLOWED_RETURN_ORIGINS", "https://shiguanglab.com,https://www.shiguanglab.com,https://opc.shiguanglab.com,https://huiguang.shiguanglab.com,https://point.shiguanglab.com,https://skills.shiguanglab.com")),
+		IAMRoleAdminOrigins:        splitCSV(envOr("IAM_ROLE_ADMIN_ORIGINS", "https://shiguanglab.com,https://point.shiguanglab.com")),
+		IAMRoleCommandPrefix:       envOr("IAM_ROLE_COMMAND_PREFIX", "auth:iam-role-command:"),
+		IAMRoleCommandTTL:          iamRoleCommandTTL,
+		LocalIdentityFixture:       os.Getenv("LOCAL_IDENTITY_FIXTURE") == "1",
+		LocalIdentityOrigin:        strings.TrimRight(strings.TrimSpace(os.Getenv("LOCAL_IDENTITY_ORIGIN")), "/"),
+		LocalIdentityServiceToken:  strings.TrimSpace(os.Getenv("LOCAL_IDENTITY_SERVICE_TOKEN")),
+		LocalIdentityRedisPrefix:   envOr("LOCAL_IDENTITY_REDIS_PREFIX", "auth:local-identity:"),
+		DefaultEntitlements:        splitCSV(envOr("DEFAULT_ENTITLEMENTS", "superagents:access,huiguang:access,platform:access")),
 		S3Endpoint:                 envOr("SA_S3_ENDPOINT", "localhost:9000"),
 		S3AccessKey:                envOr("SA_S3_ACCESS_KEY", "opc"),
 		S3SecretKey:                os.Getenv("SA_S3_SECRET_KEY"),
@@ -133,6 +169,7 @@ func Load() (Config, error) {
 		LocalBrokerProductID:       strings.TrimSpace(os.Getenv("LOCAL_BROKER_PRODUCT_ID")),
 		LocalBrokerAudience:        strings.TrimSpace(os.Getenv("LOCAL_BROKER_AUDIENCE")),
 		LocalBrokerEntitlements:    splitCSV(os.Getenv("LOCAL_BROKER_REQUIRED_ENTITLEMENTS")),
+		LocalBrokerPolicies:        localBrokerPolicies,
 		LocalBrokerTTL:             localBrokerTTL,
 	}
 	if err := cfg.Validate(); err != nil {
@@ -155,19 +192,33 @@ func (c Config) Validate() error {
 		return errors.New("session TTL configuration is invalid")
 	}
 	if c.LocalBrokerEnabled {
-		if !providerTokenPattern.MatchString(c.LocalBrokerProductID) ||
-			!providerTokenPattern.MatchString(c.LocalBrokerAudience) {
-			return errors.New("LOCAL_BROKER_PRODUCT_ID and LOCAL_BROKER_AUDIENCE must be configured tokens")
-		}
 		if c.LocalBrokerTTL <= 0 || c.LocalBrokerTTL > 24*time.Hour {
 			return errors.New("LOCAL_BROKER_TTL must be greater than zero and at most 24h")
 		}
-		if len(c.LocalBrokerEntitlements) == 0 {
-			return errors.New("LOCAL_BROKER_REQUIRED_ENTITLEMENTS must not be empty")
+		policies := c.EffectiveLocalBrokerPolicies()
+		if len(policies) == 0 {
+			return errors.New("LOCAL_BROKER_POLICIES or the legacy single-product policy must be configured")
 		}
-		for _, required := range c.LocalBrokerEntitlements {
-			if !contains(c.DefaultEntitlements, required) {
-				return fmt.Errorf("local broker entitlement %q is absent from DEFAULT_ENTITLEMENTS", required)
+		seen := make(map[string]struct{}, len(policies))
+		for _, policy := range policies {
+			if !providerTokenPattern.MatchString(policy.ProductID) ||
+				!providerTokenPattern.MatchString(policy.Audience) {
+				return errors.New("local broker productId and audience must be configured tokens")
+			}
+			if _, duplicate := seen[policy.ProductID]; duplicate {
+				return fmt.Errorf("duplicate local broker product policy %q", policy.ProductID)
+			}
+			seen[policy.ProductID] = struct{}{}
+			if len(policy.RequiredEntitlements) == 0 {
+				return fmt.Errorf("local broker product %q must require at least one entitlement", policy.ProductID)
+			}
+			for _, required := range policy.RequiredEntitlements {
+				if !entitlementTokenPattern.MatchString(required) {
+					return fmt.Errorf("invalid local broker entitlement %q", required)
+				}
+				if !contains(c.DefaultEntitlements, required) {
+					return fmt.Errorf("local broker entitlement %q is absent from DEFAULT_ENTITLEMENTS", required)
+				}
 			}
 		}
 	}
@@ -203,6 +254,27 @@ func (c Config) Validate() error {
 		if len(c.IdentityAPIToken) < 32 {
 			return errors.New("IDENTITY_API_TOKEN must contain at least 32 characters in production")
 		}
+		if len(c.PointsIdentityServiceToken) < 32 {
+			return errors.New("POINTS_IDENTITY_SERVICE_TOKEN must contain at least 32 characters in production")
+		}
+	}
+	if c.LocalIdentityFixture {
+		if c.Environment == "production" {
+			return errors.New("LOCAL_IDENTITY_FIXTURE is forbidden in production")
+		}
+		if c.SessionBackend != "redis" {
+			return errors.New("LOCAL_IDENTITY_FIXTURE requires the redis session backend")
+		}
+		parsed, err := url.Parse(c.LocalIdentityOrigin)
+		if err != nil || parsed.Scheme != "http" || (parsed.Hostname() != "127.0.0.1" && parsed.Hostname() != "localhost") || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
+			return errors.New("LOCAL_IDENTITY_ORIGIN must be an exact localhost HTTP origin")
+		}
+		if len(c.LocalIdentityServiceToken) < 32 {
+			return errors.New("LOCAL_IDENTITY_SERVICE_TOKEN must contain at least 32 characters")
+		}
+		if c.LocalIdentityRedisPrefix == "" || !strings.HasSuffix(c.LocalIdentityRedisPrefix, ":") {
+			return errors.New("LOCAL_IDENTITY_REDIS_PREFIX must end with a colon")
+		}
 	}
 	if c.FeishuAppID != "" && !providerTokenPattern.MatchString(c.FeishuAppID) {
 		return errors.New("FEISHU_APP_ID contains invalid characters")
@@ -211,16 +283,65 @@ func (c Config) Validate() error {
 		return errors.New("FEISHU_APP_ID is required when the Feishu identity provider is enabled")
 	}
 	for _, origin := range c.AllowedReturnOrigins {
-		parsed, err := url.Parse(origin)
-		validScheme := err == nil && (parsed.Scheme == "https" || (c.Environment != "production" && parsed.Scheme == "http"))
-		if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" ||
-			(parsed.Path != "" && parsed.Path != "/") || !validScheme {
+		if !validOrigin(origin, c.Environment) {
 			return fmt.Errorf("invalid allowed return origin %q", origin)
 		}
+	}
+	if len(c.IAMRoleAdminOrigins) == 0 {
+		return errors.New("IAM_ROLE_ADMIN_ORIGINS must contain at least one origin")
+	}
+	for _, origin := range c.IAMRoleAdminOrigins {
+		if !validOrigin(origin, c.Environment) {
+			return fmt.Errorf("invalid IAM role admin origin %q", origin)
+		}
+	}
+	if c.IAMRoleCommandTTL != 0 && (c.IAMRoleCommandTTL < 24*time.Hour || c.IAMRoleCommandTTL > 90*24*time.Hour) {
+		return errors.New("IAM_ROLE_COMMAND_TTL must be between 24h and 2160h")
+	}
+	if c.IAMRoleCommandPrefix != "" && !strings.HasSuffix(c.IAMRoleCommandPrefix, ":") {
+		return errors.New("IAM_ROLE_COMMAND_PREFIX must end with a colon")
 	}
 	return nil
 }
 
+func (c Config) EffectiveLocalBrokerPolicies() []LocalBrokerProductPolicy {
+	policies := c.LocalBrokerPolicies
+	if len(policies) == 0 && (c.LocalBrokerProductID != "" || c.LocalBrokerAudience != "" || len(c.LocalBrokerEntitlements) > 0) {
+		policies = []LocalBrokerProductPolicy{{
+			ProductID:            c.LocalBrokerProductID,
+			Audience:             c.LocalBrokerAudience,
+			RequiredEntitlements: c.LocalBrokerEntitlements,
+		}}
+	}
+	result := make([]LocalBrokerProductPolicy, 0, len(policies))
+	for _, policy := range policies {
+		policy.ProductID = strings.TrimSpace(policy.ProductID)
+		policy.Audience = strings.TrimSpace(policy.Audience)
+		policy.RequiredEntitlements = append([]string(nil), policy.RequiredEntitlements...)
+		for index := range policy.RequiredEntitlements {
+			policy.RequiredEntitlements[index] = strings.TrimSpace(policy.RequiredEntitlements[index])
+		}
+		result = append(result, policy)
+	}
+	return result
+}
+
+func parseLocalBrokerPolicies(raw string) ([]LocalBrokerProductPolicy, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	var policies []LocalBrokerProductPolicy
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&policies); err != nil {
+		return nil, fmt.Errorf("parse LOCAL_BROKER_POLICIES: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, errors.New("parse LOCAL_BROKER_POLICIES: one JSON array is required")
+	}
+	return policies, nil
+}
 func contains(values []string, expected string) bool {
 	for _, value := range values {
 		if value == expected {
@@ -230,6 +351,12 @@ func contains(values []string, expected string) bool {
 	return false
 }
 
+func validOrigin(origin, environment string) bool {
+	parsed, err := url.Parse(origin)
+	validScheme := err == nil && (parsed.Scheme == "https" || (environment != "production" && parsed.Scheme == "http"))
+	return err == nil && parsed.Host != "" && parsed.User == nil && parsed.RawQuery == "" && parsed.Fragment == "" &&
+		(parsed.Path == "" || parsed.Path == "/") && validScheme
+}
 func decodeKey(value string) ([]byte, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {

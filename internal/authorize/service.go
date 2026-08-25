@@ -43,6 +43,11 @@ type Service struct {
 	idleTTL           time.Duration
 	absoluteTTL       time.Duration
 	now               func() time.Time
+	roleRefresher     platformRoleRefresher
+}
+
+type platformRoleRefresher interface {
+	Refresh(context.Context, string, session.Session) (session.Session, error)
 }
 
 func NewService(store session.Store, signer *identity.Signer, cookieName string, idleTTL, absoluteTTL time.Duration) *Service {
@@ -54,6 +59,11 @@ func NewService(store session.Store, signer *identity.Signer, cookieName string,
 		absoluteTTL:       absoluteTTL,
 		now:               time.Now,
 	}
+}
+
+func (s *Service) WithPlatformRoleRefresher(refresher platformRoleRefresher) *Service {
+	s.roleRefresher = refresher
+	return s
 }
 
 func (s *Service) Decide(ctx context.Context, request Request) Response {
@@ -106,13 +116,28 @@ func (s *Service) decideCredential(ctx context.Context, credential string, reque
 		value.CreatedAt.IsZero() ||
 		value.LastSeenAt.IsZero() ||
 		value.AuthenticationTime.IsZero() {
-		return Response{Allow: false, Status: 401, Reason: "session_invalid"}
+		return Response{Allow: false, Status: 401, Reason: credentialReason(broker, "invalid")}
 	}
 	if now.Sub(value.LastSeenAt) > s.idleTTL || now.Sub(value.CreatedAt) > s.absoluteTTL {
 		return Response{Allow: false, Status: 401, Reason: credentialReason(broker, "expired")}
 	}
 	if !value.CredentialExpiresAt.IsZero() && !now.Before(value.CredentialExpiresAt) {
 		return Response{Allow: false, Status: 401, Reason: credentialReason(broker, "expired")}
+	}
+	if s.roleRefresher != nil {
+		value, err = s.roleRefresher.Refresh(ctx, credential, value)
+		if err != nil {
+			return Response{Allow: false, Status: 503, Reason: "session_store_unavailable"}
+		}
+		if !value.RevokedAt.IsZero() {
+			return Response{Allow: false, Status: 401, Reason: "session_revoked"}
+		}
+		if now.Sub(value.LastSeenAt) > s.idleTTL || now.Sub(value.CreatedAt) > s.absoluteTTL {
+			return Response{Allow: false, Status: 401, Reason: credentialReason(broker, "expired")}
+		}
+		if !value.CredentialExpiresAt.IsZero() && !now.Before(value.CredentialExpiresAt) {
+			return Response{Allow: false, Status: 401, Reason: credentialReason(broker, "expired")}
+		}
 	}
 	if !containsAll(value.Entitlements, request.RequiredEntitlements) {
 		return Response{Allow: false, Status: 403, Reason: "missing_entitlement"}

@@ -26,7 +26,8 @@ the shared browser cookie or ZITADEL tokens.
 
 ## Implemented
 
-- Gateway-protected `GET /v1/forward-auth`
+- Canonical Access Gateway decision API: `POST /v1/authorize`
+- Compatibility forward-auth adapter: `GET /v1/forward-auth`
 - Missing and duplicate shared-cookie rejection
 - Memory session store for tests and development
 - AES-256-GCM encrypted Redis sessions and login transactions
@@ -37,6 +38,12 @@ the shared browser cookie or ZITADEL tokens.
 - Feishu OAuth login through a ZITADEL generic provider and Auth Service's current-API compatibility adapter
 - Parent-domain opaque session creation, inspection, and logout
 - Origin validation, CSRF protection, and Redis login rate limiting
+- Portal product-role aggregation plus bounded ACTIVE-user directory search for
+  绘光、映光、灵光 and Points role administration
+- Backward-compatible Points-only IAM endpoints and fail-closed production
+  writes until a permanent audit sink and ZITADEL writer are configured
+- 60-second platform-role freshness with process-local concurrent refresh
+  suppression and privilege-clearing failure behavior
 
 Back-channel logout and automated signing-key rotation remain operational
 follow-ups. Explicit logout revokes both platform and ZITADEL sessions.
@@ -63,6 +70,27 @@ NAS deployments load this non-secret mapping from the versioned
 `deploy/auth.env`/secret files; when migrating ZITADEL, update only the provider
 IDs in `deploy/oidc-providers.env` and the corresponding provider registrations.
 
+### Local full-stack identity fixture
+
+`LOCAL_IDENTITY_FIXTURE=1` enables an explicit development-only implementation
+of login, session refresh, the Points identity directory, and a fake IAM role
+provider. It requires encrypted Redis sessions and an exact HTTP localhost
+origin; configuration validation rejects it in production or on a non-local
+origin. The fake provider is connected to the real encrypted Redis command
+journal, so idempotent replay, conflicts, reconciliation, and controlled retry
+exercise the production command boundary without calling ZITADEL.
+
+Use the checked-in orchestration from the sibling Access Gateway repository:
+
+```bash
+cd ../access-gateway
+make local-e2e
+```
+
+Fixture recovery and failure-injection endpoints are mounted only while the
+fixture flag is active and still require the local IAM manager session. Normal
+production startup keeps the IAM writer nil and fail-closed.
+
 ## Endpoints
 
 | Method | Path | Authentication |
@@ -70,7 +98,8 @@ IDs in `deploy/oidc-providers.env` and the corresponding provider registrations.
 | `GET` | `/health/live` | Public |
 | `GET` | `/health/ready` | Public |
 | `GET` | `/.well-known/jwks.json` | Public |
-| `GET` | `/v1/forward-auth` | `X-SG-Gateway-Token` |
+| `POST` | `/v1/authorize` | `X-SG-Gateway-Token`; strict JSON decision protocol |
+| `GET` | `/v1/forward-auth` | `X-SG-Gateway-Token`; compatibility adapter only |
 | `GET` | `/api/auth/federated/start` | Gateway token; federated login only |
 | `GET` | `/api/auth/providers/feishu/authorize` | Gateway token; ZITADEL-to-Feishu authorization adapter |
 | `POST` | `/api/auth/providers/feishu/token` | Gateway token; ZITADEL-to-Feishu token adapter |
@@ -83,10 +112,29 @@ IDs in `deploy/oidc-providers.env` and the corresponding provider registrations.
 | `POST` | `/api/auth/register/federated` | Gateway token + Origin + CSRF |
 | `GET` | `/api/auth/session` | Gateway token + session cookie |
 | `POST` | `/api/auth/logout` | Gateway token + Origin |
+| `GET` | `/api/auth/portal/access` | Gateway token + session cookie |
+| `POST` | `/api/auth/iam/product-role-assignments/search` | Gateway token + IAM manager session + Origin |
+| `POST` | `/api/auth/iam/product-role-assignments/resolve` | Gateway token + IAM manager session + Origin |
+| `PUT` | `/api/auth/iam/product-role-assignments/{userId}` | Gateway token + IAM manager session + Origin + idempotency key |
+| `POST` | `/v1/identity/users/search` | `POINTS_IDENTITY_SERVICE_TOKEN`; server-side only |
+| `POST` | `/v1/identity/users/resolve` | `POINTS_IDENTITY_SERVICE_TOKEN`; server-side only |
 
-The forward-auth endpoint consumes the standard `X-Forwarded-Method`,
+`POST /v1/authorize` is the canonical internal protocol for Access Gateway.
+It accepts a bounded JSON `authorize.Request` with unknown fields rejected and
+returns an `authorize.Response` for allow, deny, and login-redirect decisions.
+The shared credential is accepted only in `X-SG-Gateway-Token`; bearer auth is
+not part of this protocol.
+
+The compatibility forward-auth endpoint consumes the standard `X-Forwarded-Method`,
 `X-Forwarded-Uri`, `X-Forwarded-Host`, and `X-Forwarded-Proto` headers plus
 gateway-owned product policy headers. On success it returns `X-SG-Identity`.
+
+Points user selection is a two-step server-side contract. `search` accepts a
+trimmed 3-64 character query and limit 1-10, and returns only ACTIVE users as
+`{id, loginName, displayName, state}`. Before persisting a membership, the
+Points backend calls `resolve` with `{userId}` to repeat an exact ACTIVE check.
+The dedicated credential must remain in the Points server secret store and is
+never sent to Points Web or a browser.
 
 See [docs/architecture.md](docs/architecture.md) for trust boundaries and the
 request flow, and [docs/integration.md](docs/integration.md) for the product

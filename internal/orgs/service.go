@@ -597,7 +597,7 @@ func (s *Service) membershipsOf(ctx context.Context, userID string) ([]zitadel.A
 		return nil, err
 	}
 	// Authorizations on the platform organization carry system-level roles
-	// (for example opc:system-admin). The platform organization is identity
+	// (for example system-admin). The platform organization is identity
 	// plumbing, not a business tenant: it must never surface as a switchable
 	// organization.
 	memberships := authorizations[:0]

@@ -16,7 +16,11 @@ import (
 
 const (
 	DefaultTTL     = 60 * time.Second
-	DefaultTimeout = 2 * time.Second
+	// ZITADEL authorization search can take around two seconds on the NAS
+	// during a cold database/cache path. Keep the refresh bounded, but leave
+	// enough headroom so a transient slow lookup does not hide every
+	// platform-admin menu from an otherwise valid session.
+	DefaultTimeout = 5 * time.Second
 )
 
 type Directory interface {

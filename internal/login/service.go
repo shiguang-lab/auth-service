@@ -955,8 +955,8 @@ func (s *Service) Session(response http.ResponseWriter, request *http.Request) {
 		"platformRoles":     value.PlatformRoles,
 		"iamCapabilities": map[string]any{
 			"pointsRoleAssignments": map[string]any{
-				"read":            slices.Contains(value.PlatformRoles, "opc:system-admin"),
-				"write":           slices.Contains(value.PlatformRoles, "opc:system-admin"),
+				"read":            slices.Contains(value.PlatformRoles, "system-admin"),
+				"write":           slices.Contains(value.PlatformRoles, "system-admin"),
 				"manageableRoles": []string{"platform:points-admin", "platform:points-auditor"},
 			},
 		},

@@ -19,7 +19,7 @@ type Session struct {
 	// Roles of the active business-organization context (empty when personal).
 	Roles []string `json:"roles,omitempty"`
 	// PlatformRoles are context-independent roles granted on the platform
-	// project itself (for example opc:system-admin). They survive context
+	// project itself (for example system-admin). They survive context
 	// switches and are merged into every assertion.
 	PlatformRoles            []string  `json:"platform_roles,omitempty"`
 	PlatformRolesRefreshedAt time.Time `json:"platform_roles_refreshed_at,omitempty"`

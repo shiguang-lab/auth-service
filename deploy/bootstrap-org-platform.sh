@@ -109,7 +109,7 @@ for role in \
   "org:admin|Organization Admin" \
   "org:member|Organization Member" \
   "org:viewer|Organization Viewer" \
-  "opc:system-admin|OPC 系统管理员" \
+  "system-admin|系统管理员" \
   "platform:points-admin|Points Administrator" \
   "platform:points-auditor|Points Auditor"; do
   key="${role%%|*}"; display="${role#*|}"
@@ -135,7 +135,7 @@ done
 # on the platform project's own organization; the roles therefore reach every
 # assertion independent of the active business-organization context.
 PLATFORM_ADMIN_LOGIN_NAME="${PLATFORM_ADMIN_LOGIN_NAME:-yanxianliang}"
-PLATFORM_ADMIN_ROLE_KEYS="${PLATFORM_ADMIN_ROLE_KEYS:-opc:system-admin platform:points-admin}"
+PLATFORM_ADMIN_ROLE_KEYS="${PLATFORM_ADMIN_ROLE_KEYS:-system-admin platform:points-admin}"
 jq -n --arg loginName "$PLATFORM_ADMIN_LOGIN_NAME" \
   '{queries:[{loginNameQuery:{loginName:$loginName,method:"TEXT_QUERY_METHOD_EQUALS_IGNORE_CASE"}}]}' \
   > "$workdir/admin-user-search.json"

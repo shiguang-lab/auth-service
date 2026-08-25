@@ -8,12 +8,12 @@ not manage application membership.
 | Capability | Source | Meaning |
 | --- | --- | --- |
 | Base access | `platform:access` entitlement | May open the Points host after unified login |
-| IAM manager | `opc:system-admin` platform role | Sole caller allowed to grant or revoke Points platform roles |
+| IAM manager | global `system-admin` role | Sole caller allowed to grant or revoke Points platform roles |
 | Points administrator | `platform:points-admin` platform role | Global Points read/write operations |
 | Points auditor | `platform:points-auditor` platform role | Global Points read-only operations |
 | Application manager | Points Service ACTIVE `OWNER`/`ADMIN` membership | One application's credentials, ledger, audit, and supported settings |
 
-`opc:system-admin` already exists in the platform IAM model, so no duplicate
+The global `system-admin` role is managed centrally, so no duplicate
 `platform:iam-admin` role is introduced. Platform roles and application
 membership are combined as a permission union, but are stored and managed in
 different systems. IAM role management never writes an application membership.
@@ -26,8 +26,8 @@ The Points host routes the following protected prefix to Auth Service:
 
 The gateway requires `platform:access`, forwards only the shared session cookie
 and its internal gateway credential, and strips browser `Authorization`.
-Auth Service refreshes the session's platform roles and requires
-`opc:system-admin` on every request.
+Auth Service refreshes the session's platform roles and requires the global
+`system-admin` role on every request.
 
 Every endpoint also requires an exact browser `Origin` from the dedicated
 `IAM_ROLE_ADMIN_ORIGINS` allowlist. Production defaults to only
@@ -101,7 +101,7 @@ does not expose them on the browser router:
 
 A future internal route may expose `GET /internal/v1/iam/points-role-commands`
 and `POST /internal/v1/iam/points-role-commands/{operationId}/retry` only behind
-an internal service credential plus a refreshed `opc:system-admin` principal.
+an internal service credential plus a refreshed `system-admin` principal.
 It must never be added to the public Points browser gateway prefix without a
 separate review.
 
@@ -125,7 +125,7 @@ service token:
 }
 ```
 
-Only `opc:system-admin` receives `read:true` and `write:true`. The UI uses this
+Only `system-admin` receives `read:true` and `write:true`. The UI uses this
 capability for discoverability; Auth Service authorization remains decisive.
 
 ## Threat model and controls
@@ -134,7 +134,7 @@ capability for discoverability; Auth Service authorization remains decisive.
   receives `403`, including direct API calls that bypass hidden navigation.
 - A caller cannot modify its own privileged roles. This prevents self-demotion
   from bypassing review and self-elevation through mixed-role requests.
-- The API cannot create, revoke, or mutate `opc:system-admin`. Consequently it
+- The API cannot create, revoke, or mutate `system-admin`. Consequently it
   cannot remove the last IAM manager. Any future API that manages IAM-manager
   roles must add an explicit last-active-manager invariant at the writer.
 - Read and write operations have separate per-actor rate limits. Provider

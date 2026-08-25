@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	IAMManagerRole    = "opc:system-admin"
+	IAMManagerRole    = "system-admin"
 	PointsAdminRole   = "platform:points-admin"
 	PointsAuditorRole = "platform:points-auditor"
 	maxRequestBytes   = 16 << 10

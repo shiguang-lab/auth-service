@@ -118,6 +118,11 @@ func (s *Server) Handler() http.Handler {
 	router.Get("/.well-known/jwks.json", s.handleJWKS)
 	router.With(s.authenticateGateway).Get("/v1/forward-auth", s.handleForwardAuth)
 	router.With(s.authenticateGateway).Post("/v1/authorize", s.handleAuthorize)
+	// The console host uses this same-origin exchange to obtain the
+	// audience-bound assertion for the model-gateway micro-frontend.  The
+	// product and audience are intentionally fixed here; callers cannot mint a
+	// token for an arbitrary service.
+	router.With(s.authenticateGateway).Get("/api/auth/identity-token", s.handleIdentityToken)
 	if s.localIdentity != nil {
 		router.Group(func(local chi.Router) {
 			local.Use(s.authenticateGateway)
@@ -365,6 +370,32 @@ func (s *Server) handleForwardAuth(response http.ResponseWriter, request *http.R
 		return
 	}
 	writeJSON(response, decision.Status, map[string]string{"error": decision.Reason})
+}
+
+func (s *Server) handleIdentityToken(response http.ResponseWriter, request *http.Request) {
+	input := authorize.Request{
+		RequestID: middleware.GetReqID(request.Context()),
+		Method:    http.MethodGet,
+		Scheme:    request.Header.Get("X-Forwarded-Proto"),
+		Host:      forwardedHost(request),
+		Path:      "/api/auth/identity-token",
+		ClientIP:  request.Header.Get("X-Forwarded-For"),
+		Cookie:    request.Header.Get("Cookie"),
+		Origin:    request.Header.Get("Origin"),
+		Accept:    request.Header.Get("Accept"),
+		ProductID: "model-gateway",
+		Audience:  "model-gateway-bff",
+	}
+	decision := s.decide(request.Context(), input)
+	for _, cookie := range decision.SetCookies {
+		response.Header().Add("Set-Cookie", cookie)
+	}
+	if !decision.Allow {
+		writeJSON(response, decision.Status, map[string]string{"error": decision.Reason})
+		return
+	}
+	response.Header().Set("Cache-Control", "no-store")
+	writeJSON(response, http.StatusOK, map[string]string{"identityToken": decision.IdentityToken})
 }
 
 func (s *Server) handleAuthorize(response http.ResponseWriter, request *http.Request) {

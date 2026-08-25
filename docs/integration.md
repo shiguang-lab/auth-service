@@ -151,7 +151,7 @@ NAS 内网(推荐,免公网回环)`http://auth-service:8081/.well-known/jwks.jso
 **角色语义**:
 
 - `org:admin / org:member / org:viewer` —— 组织内角色,仅组织上下文出现;
-- `opc:system-admin`(OPC 系统管理员)等**平台角色**:与上下文无关,
+- `system-admin`(全局系统管理员)等**平台角色**:与上下文无关,
   个人/组织断言中都存在;用于平台级资源(如内置 Agent 管理)的门禁;
 - `platform:points-admin / platform:points-auditor`分别对应积分平台管理和全局只读审计;
   接入方管理员不是 IAM 全局角色,其唯一授权依据是 Points Service 中基于断言

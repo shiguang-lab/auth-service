@@ -3,3 +3,6 @@ deploy/feishu-oauth.env
 deploy/feishu-provider.env
 deploy/zitadel-oidc.env
 deploy/identity-signing.pem
+
+# Compiled binary artifacts (never commit build output)
+/auth-service

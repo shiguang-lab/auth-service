@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"path"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -1467,6 +1468,13 @@ func (s *Service) Session(response http.ResponseWriter, request *http.Request) {
 		"organization":      organization,
 		"roles":             value.Roles,
 		"platformRoles":     value.PlatformRoles,
+		"iamCapabilities": map[string]any{
+			"pointsRoleAssignments": map[string]any{
+				"read":            slices.Contains(value.PlatformRoles, "opc:system-admin"),
+				"write":           slices.Contains(value.PlatformRoles, "opc:system-admin"),
+				"manageableRoles": []string{"platform:points-admin", "platform:points-auditor"},
+			},
+		},
 	})
 }
 

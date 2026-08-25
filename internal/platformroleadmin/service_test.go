@@ -145,7 +145,7 @@ func TestRoleManagementAuthorizationAllowlistAndIdempotency(t *testing.T) {
 		t.Fatalf("changes = %#v", directory.changes)
 	}
 
-	unmanaged := serve(manager, http.MethodPut, "/api/auth/iam/points-role-assignments/target", `{"roles":["opc:system-admin"]}`)
+	unmanaged := serve(manager, http.MethodPut, "/api/auth/iam/points-role-assignments/target", `{"roles":["system-admin"]}`)
 	assertError(t, unmanaged, http.StatusUnprocessableEntity, "iam_role_not_manageable")
 	unknown := serve(manager, http.MethodPut, "/api/auth/iam/points-role-assignments/target", `{"roles":[],"issuer":"forged"}`)
 	assertError(t, unknown, http.StatusBadRequest, "invalid_request")

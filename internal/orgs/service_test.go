@@ -366,12 +366,12 @@ func TestPlatformOrgNeverSurfacesAsTenant(t *testing.T) {
 	handler := routerFor(service)
 
 	// A system-level authorization on the platform organization (for example
-	// opc:system-admin) must not appear in "my organizations"…
+	// system-admin) must not appear in "my organizations"…
 	directory.organizations["platform-org"] = "ZITADEL"
 	directory.nextID++
 	directory.authorizations["authz-platform"] = zitadel.Authorization{
 		ID: "authz-platform", UserID: "alice", OrganizationID: "platform-org",
-		Roles: []string{"opc:system-admin"}, State: "STATE_ACTIVE",
+		Roles: []string{"system-admin"}, State: "STATE_ACTIVE",
 	}
 
 	listed := doJSON(t, handler, http.MethodGet, "/api/account/orgs", sessionID, "", nil)

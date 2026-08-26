@@ -1,4 +1,4 @@
-.PHONY: build test vet run
+.PHONY: build test vet run smoke-portal
 
 build:
 	CGO_ENABLED=0 go build -trimpath -o bin/auth-service ./cmd/auth-service
@@ -11,3 +11,6 @@ vet:
 
 run:
 	go run ./cmd/auth-service
+
+smoke-portal:
+	./deploy/verify-portal-release.sh

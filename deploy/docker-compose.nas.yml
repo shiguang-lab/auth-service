@@ -24,7 +24,7 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
-    image: shiguang/auth-service:local
+    image: ${AUTH_SERVICE_IMAGE:-shiguang/auth-service:local}
     restart: unless-stopped
     user: "1000:10"
     env_file:

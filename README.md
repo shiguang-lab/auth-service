@@ -144,6 +144,10 @@ integration guide (assertion contract, shared endpoints, checklists).
 
 `deploy/docker-compose.nas.yml` runs Redis and Auth Service on an internal
 backend network and exposes Auth Service only through `shiguang-auth-edge`.
+Version tags matching `v*` publish `ghcr.io/shiguang-lab/auth-service` through
+GitHub Actions. Set `AUTH_SERVICE_IMAGE_TAG` in `deploy/auth.env` to the release
+tag, then run `docker compose --env-file deploy/auth.env -f deploy/docker-compose.nas.yml pull`
+and `docker compose --env-file deploy/auth.env -f deploy/docker-compose.nas.yml up -d`.
 `deploy/bootstrap-zitadel.sh` creates the confidential OIDC application through
 official ZITADEL APIs and writes its one-time secret only to the NAS private
 `deploy/zitadel-oidc.env` file.

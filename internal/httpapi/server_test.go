@@ -14,6 +14,7 @@ import (
 
 	"github.com/shiguanglab/auth-service/internal/authorize"
 	"github.com/shiguanglab/auth-service/internal/identity"
+	oauthservice "github.com/shiguanglab/auth-service/internal/oauth"
 	"github.com/shiguanglab/auth-service/internal/session"
 )
 
@@ -279,4 +280,97 @@ func authorizeRequest(t *testing.T, server http.Handler, input authorize.Request
 	response := httptest.NewRecorder()
 	server.ServeHTTP(response, request)
 	return response
+}
+
+// The authorization server endpoints are opt-in: an untouched deployment must
+// keep serving exactly the routes it served before.
+func TestOAuthEndpointsAreAbsentByDefault(t *testing.T) {
+	server, _ := newTestServer(t)
+	for _, path := range []string{
+		"/.well-known/oauth-authorization-server",
+		"/oauth/authorize",
+		"/oauth/token",
+		"/oauth/revoke",
+	} {
+		t.Run(path, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+			if response.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404", response.Code)
+			}
+		})
+	}
+}
+
+// Native clients cannot present the gateway token, so the OAuth routes must be
+// reachable without it — while the existing routes stay guarded.
+func TestOAuthEndpointsBypassGatewayAuthentication(t *testing.T) {
+	server, _ := newOAuthTestServer(t)
+
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/.well-known/oauth-authorization-server", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("metadata status = %d, want 200", response.Code)
+	}
+
+	// A token request without the gateway token reaches the handler and fails
+	// on its own terms (unsupported grant type), not with a 401.
+	form := strings.NewReader("grant_type=password")
+	request := httptest.NewRequest(http.MethodPost, "/oauth/token", form)
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("token status = %d, want 400", response.Code)
+	}
+
+	// The pre-existing protected route is unaffected.
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/forward-auth", nil))
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("forward-auth status = %d, want 401", response.Code)
+	}
+}
+
+func newOAuthTestServer(t *testing.T) (http.Handler, *session.MemoryStore) {
+	t.Helper()
+	signer, err := identity.NewSigner("https://auth.shiguanglab.com", "test-key", "", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := session.NewMemoryStore()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	decision := authorize.NewService(store, signer, "__Secure-sg_session", 12*time.Hour, 7*24*time.Hour)
+	server := NewServer(decision, signer, testGatewayToken, store.Ping, logger)
+
+	registry, err := oauthservice.NewRegistry([]oauthservice.ClientPolicy{{
+		ClientID:     "obsidian-asset-hub",
+		Name:         "知序资产中心 for Obsidian",
+		RedirectURIs: []string{"http://127.0.0.1/callback"},
+		Scopes:       []string{oauthservice.ScopeDocumentsRead, oauthservice.ScopeOfflineAccess},
+		Audience:     "asset-hub-api",
+		AccessTTL:    15 * time.Minute,
+		RefreshTTL:   30 * 24 * time.Hour,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := oauthservice.NewService(oauthservice.ServiceOptions{
+		Registry:             registry,
+		Store:                oauthservice.NewMemoryStore(),
+		Sessions:             store,
+		Signer:               signer,
+		Issuer:               "https://shiguanglab.com",
+		CookieName:           "__Secure-sg_session",
+		LoginURL:             "https://shiguanglab.com/login",
+		IdleTTL:              12 * time.Hour,
+		AbsoluteTTL:          7 * 24 * time.Hour,
+		CodeTTL:              time.Minute,
+		ConsentTTL:           10 * time.Minute,
+		RequiredEntitlements: []string{"asset-hub:access"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return server.WithOAuth(oauthservice.NewHandler(service, logger)).Handler(), store
 }

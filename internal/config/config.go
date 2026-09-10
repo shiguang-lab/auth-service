@@ -81,6 +81,23 @@ type Config struct {
 	LocalBrokerEntitlements    []string
 	LocalBrokerPolicies        []LocalBrokerProductPolicy
 	LocalBrokerTTL             time.Duration
+
+	// OAuth 2.0 authorization server settings. Disabled by default; the router
+	// only mounts the endpoints once a handler is supplied.
+	OAuthEnabled              bool
+	OAuthIssuer               string
+	OAuthLoginURL             string
+	OAuthClientID             string
+	OAuthClientName           string
+	OAuthClientRedirectURIs   []string
+	OAuthClientScopes         []string
+	OAuthClientAudience       string
+	OAuthAccessTokenTTL       time.Duration
+	OAuthRefreshTokenTTL      time.Duration
+	OAuthCodeTTL              time.Duration
+	OAuthConsentTTL           time.Duration
+	OAuthRequiredEntitlements []string
+	OAuthRedisKeyPrefix       string
 }
 
 func Load() (Config, error) {
@@ -116,6 +133,22 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	localBrokerPolicies, err := parseLocalBrokerPolicies(os.Getenv("LOCAL_BROKER_POLICIES"))
+	if err != nil {
+		return Config{}, err
+	}
+	oauthAccessTokenTTL, err := durationOr("OAUTH_ACCESS_TOKEN_TTL", 15*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	oauthRefreshTokenTTL, err := durationOr("OAUTH_REFRESH_TOKEN_TTL", 30*24*time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
+	oauthCodeTTL, err := durationOr("OAUTH_CODE_TTL", time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	oauthConsentTTL, err := durationOr("OAUTH_CONSENT_TTL", 10*time.Minute)
 	if err != nil {
 		return Config{}, err
 	}
@@ -171,11 +204,95 @@ func Load() (Config, error) {
 		LocalBrokerEntitlements:    splitCSV(os.Getenv("LOCAL_BROKER_REQUIRED_ENTITLEMENTS")),
 		LocalBrokerPolicies:        localBrokerPolicies,
 		LocalBrokerTTL:             localBrokerTTL,
+		OAuthEnabled:               strings.EqualFold(strings.TrimSpace(os.Getenv("OAUTH_ENABLED")), "true"),
+		OAuthIssuer:                strings.TrimRight(strings.TrimSpace(os.Getenv("OAUTH_ISSUER")), "/"),
+		OAuthLoginURL:              strings.TrimSpace(os.Getenv("OAUTH_LOGIN_URL")),
+		OAuthClientID:              envOr("OAUTH_CLIENT_ID", "obsidian-asset-hub"),
+		OAuthClientName:            envOr("OAUTH_CLIENT_NAME", "知序资产中心 for Obsidian"),
+		OAuthClientRedirectURIs:    splitCSV(envOr("OAUTH_CLIENT_REDIRECT_URIS", "http://127.0.0.1/callback,http://[::1]/callback")),
+		OAuthClientScopes:          splitCSV(envOr("OAUTH_CLIENT_SCOPES", "documents:read,documents:write,offline_access")),
+		OAuthClientAudience:        envOr("OAUTH_CLIENT_AUDIENCE", "asset-hub-api"),
+		OAuthAccessTokenTTL:        oauthAccessTokenTTL,
+		OAuthRefreshTokenTTL:       oauthRefreshTokenTTL,
+		OAuthCodeTTL:               oauthCodeTTL,
+		OAuthConsentTTL:            oauthConsentTTL,
+		OAuthRequiredEntitlements:  splitCSV(envOr("OAUTH_REQUIRED_ENTITLEMENTS", "asset-hub:access")),
+		OAuthRedisKeyPrefix:        envOr("OAUTH_REDIS_KEY_PREFIX", "auth:oauth:"),
+	}
+	if cfg.OAuthIssuer == "" {
+		cfg.OAuthIssuer = cfg.PublicOrigin
+	}
+	if cfg.OAuthLoginURL == "" {
+		cfg.OAuthLoginURL = cfg.PublicOrigin + "/login"
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// oauthKnownScopes is the closed set the authorization server can grant.
+var oauthKnownScopes = []string{"documents:read", "documents:write", "offline_access"}
+
+func (c Config) validateOAuth() error {
+	if !c.OAuthEnabled {
+		return nil
+	}
+	if !providerTokenPattern.MatchString(c.OAuthClientID) {
+		return errors.New("OAUTH_CLIENT_ID must be a plain token")
+	}
+	if len(c.OAuthClientRedirectURIs) == 0 {
+		return errors.New("OAUTH_CLIENT_REDIRECT_URIS must list at least one redirect URI")
+	}
+	if c.OAuthClientAudience == "" {
+		return errors.New("OAUTH_CLIENT_AUDIENCE is required")
+	}
+	if !isAbsoluteURL(c.OAuthIssuer, c.Environment) {
+		return errors.New("OAUTH_ISSUER must be an absolute http(s) URL")
+	}
+	if !isAbsoluteURL(c.OAuthLoginURL, c.Environment) {
+		return errors.New("OAUTH_LOGIN_URL must be an absolute http(s) URL")
+	}
+	if len(c.OAuthClientScopes) == 0 {
+		return errors.New("OAUTH_CLIENT_SCOPES must list at least one scope")
+	}
+	for _, scope := range c.OAuthClientScopes {
+		if !contains(oauthKnownScopes, scope) {
+			return fmt.Errorf("unsupported OAuth scope %q", scope)
+		}
+	}
+	if len(c.OAuthRequiredEntitlements) == 0 {
+		return errors.New("OAUTH_REQUIRED_ENTITLEMENTS must list at least one entitlement")
+	}
+	for _, entitlement := range c.OAuthRequiredEntitlements {
+		if !entitlementTokenPattern.MatchString(entitlement) {
+			return fmt.Errorf("invalid OAuth entitlement %q", entitlement)
+		}
+	}
+	if c.OAuthAccessTokenTTL <= 0 || c.OAuthAccessTokenTTL > time.Hour {
+		return errors.New("OAUTH_ACCESS_TOKEN_TTL must be greater than zero and at most 1h")
+	}
+	if c.OAuthRefreshTokenTTL <= 0 || c.OAuthRefreshTokenTTL > 90*24*time.Hour {
+		return errors.New("OAUTH_REFRESH_TOKEN_TTL must be greater than zero and at most 2160h")
+	}
+	if c.OAuthCodeTTL <= 0 || c.OAuthCodeTTL > 10*time.Minute {
+		return errors.New("OAUTH_CODE_TTL must be greater than zero and at most 10m")
+	}
+	if c.OAuthConsentTTL <= 0 || c.OAuthConsentTTL > 30*time.Minute {
+		return errors.New("OAUTH_CONSENT_TTL must be greater than zero and at most 30m")
+	}
+	if c.OAuthRedisKeyPrefix == "" || !strings.HasSuffix(c.OAuthRedisKeyPrefix, ":") {
+		return errors.New("OAUTH_REDIS_KEY_PREFIX must end with a colon")
+	}
+	return nil
+}
+
+func isAbsoluteURL(value, environment string) bool {
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return false
+	}
+	return parsed.Scheme == "https" || (environment != "production" && parsed.Scheme == "http")
 }
 
 func (c Config) Validate() error {
@@ -300,6 +417,9 @@ func (c Config) Validate() error {
 	}
 	if c.IAMRoleCommandPrefix != "" && !strings.HasSuffix(c.IAMRoleCommandPrefix, ":") {
 		return errors.New("IAM_ROLE_COMMAND_PREFIX must end with a colon")
+	}
+	if err := c.validateOAuth(); err != nil {
+		return err
 	}
 	return nil
 }

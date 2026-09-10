@@ -271,3 +271,96 @@ func TestLocalBrokerSupportsMultipleServerOwnedProductPolicies(t *testing.T) {
 		t.Fatalf("expected duplicate product error, got %v", err)
 	}
 }
+
+func oauthBaseConfig() Config {
+	return Config{
+		Environment: "development", GatewayToken: strings.Repeat("x", 32), SessionBackend: "memory",
+		SessionCookieName: "session", IdentityIssuer: "https://auth.shiguanglab.com", SigningKeyID: "key",
+		IdentityTokenTTL: time.Minute, IdleTTL: time.Hour, AbsoluteTTL: 24 * time.Hour,
+		IAMRoleAdminOrigins: []string{"http://127.0.0.1:3002"},
+	}
+}
+
+func TestOAuthIsOptIn(t *testing.T) {
+	t.Setenv("APP_ENV", "development")
+	t.Setenv("GATEWAY_SHARED_TOKEN", strings.Repeat("g", 32))
+	t.Setenv("SESSION_BACKEND", "memory")
+	t.Setenv("OAUTH_ENABLED", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OAuthEnabled {
+		t.Fatal("the OAuth authorization server must be opt-in")
+	}
+}
+
+func TestOAuthDefaultsAreUsableWhenEnabled(t *testing.T) {
+	t.Setenv("APP_ENV", "development")
+	t.Setenv("GATEWAY_SHARED_TOKEN", strings.Repeat("g", 32))
+	t.Setenv("SESSION_BACKEND", "memory")
+	t.Setenv("OAUTH_ENABLED", "true")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OAuthClientID != "obsidian-asset-hub" {
+		t.Fatalf("client id = %q", cfg.OAuthClientID)
+	}
+	if cfg.OAuthIssuer != cfg.PublicOrigin {
+		t.Fatalf("issuer = %q, want the public origin %q", cfg.OAuthIssuer, cfg.PublicOrigin)
+	}
+	if cfg.OAuthLoginURL != cfg.PublicOrigin+"/login" {
+		t.Fatalf("login url = %q", cfg.OAuthLoginURL)
+	}
+	if !slices.Equal(cfg.OAuthClientRedirectURIs, []string{"http://127.0.0.1/callback", "http://[::1]/callback"}) {
+		t.Fatalf("redirect uris = %#v", cfg.OAuthClientRedirectURIs)
+	}
+	if cfg.OAuthAccessTokenTTL != 15*time.Minute || cfg.OAuthRefreshTokenTTL != 30*24*time.Hour {
+		t.Fatalf("token TTLs = %v / %v", cfg.OAuthAccessTokenTTL, cfg.OAuthRefreshTokenTTL)
+	}
+}
+
+func TestOAuthValidationRejectsUnsafeConfiguration(t *testing.T) {
+	cases := map[string]func(*Config){
+		"unknown scope": func(c *Config) { c.OAuthClientScopes = []string{"documents:admin"} },
+		"long access ttl": func(c *Config) {
+			c.OAuthAccessTokenTTL = 2 * time.Hour
+		},
+		"long code ttl":        func(c *Config) { c.OAuthCodeTTL = 30 * time.Minute },
+		"plain client id":      func(c *Config) { c.OAuthClientID = "obsidian asset hub" },
+		"no entitlement":       func(c *Config) { c.OAuthRequiredEntitlements = nil },
+		"bad entitlement":      func(c *Config) { c.OAuthRequiredEntitlements = []string{"bad entitlement"} },
+		"prefix without colon": func(c *Config) { c.OAuthRedisKeyPrefix = "auth:oauth" },
+		"relative issuer":      func(c *Config) { c.OAuthIssuer = "/oauth" },
+		"issuer with query":    func(c *Config) { c.OAuthIssuer = "https://shiguanglab.com/?next=1" },
+		"missing audience":     func(c *Config) { c.OAuthClientAudience = "" },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			cfg := oauthBaseConfig()
+			cfg.OAuthEnabled = true
+			cfg.OAuthIssuer = "https://shiguanglab.com"
+			cfg.OAuthLoginURL = "https://shiguanglab.com/login"
+			cfg.OAuthClientID = "obsidian-asset-hub"
+			cfg.OAuthClientScopes = []string{"documents:read", "documents:write", "offline_access"}
+			cfg.OAuthClientRedirectURIs = []string{"http://127.0.0.1/callback"}
+			cfg.OAuthClientAudience = "asset-hub-api"
+			cfg.OAuthRequiredEntitlements = []string{"asset-hub:access"}
+			cfg.OAuthAccessTokenTTL = 15 * time.Minute
+			cfg.OAuthRefreshTokenTTL = 30 * 24 * time.Hour
+			cfg.OAuthCodeTTL = time.Minute
+			cfg.OAuthConsentTTL = 10 * time.Minute
+			cfg.OAuthRedisKeyPrefix = "auth:oauth:"
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("baseline must validate: %v", err)
+			}
+			mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("expected the configuration to be rejected")
+			}
+		})
+	}
+}

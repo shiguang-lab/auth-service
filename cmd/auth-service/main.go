@@ -18,6 +18,7 @@ import (
 	"github.com/shiguanglab/auth-service/internal/identity"
 	"github.com/shiguanglab/auth-service/internal/localidentity"
 	loginservice "github.com/shiguanglab/auth-service/internal/login"
+	oauthservice "github.com/shiguanglab/auth-service/internal/oauth"
 	orgservice "github.com/shiguanglab/auth-service/internal/orgs"
 	"github.com/shiguanglab/auth-service/internal/platformroleadmin"
 	"github.com/shiguanglab/auth-service/internal/platformroles"
@@ -186,6 +187,60 @@ func main() {
 	}
 	if directory != nil {
 		api.WithOrganizations(orgservice.NewService(cfg, store, login, directory, logger))
+	}
+	if cfg.OAuthEnabled {
+		registry, err := oauthservice.NewRegistry([]oauthservice.ClientPolicy{{
+			ClientID:     cfg.OAuthClientID,
+			Name:         cfg.OAuthClientName,
+			RedirectURIs: cfg.OAuthClientRedirectURIs,
+			Scopes:       cfg.OAuthClientScopes,
+			Audience:     cfg.OAuthClientAudience,
+			AccessTTL:    cfg.OAuthAccessTokenTTL,
+			RefreshTTL:   cfg.OAuthRefreshTokenTTL,
+		}})
+		if err != nil {
+			logger.Error("initialize oauth client registry", "error", err)
+			os.Exit(1)
+		}
+		var oauthStore oauthservice.Store
+		if redisOptions != nil {
+			redisOAuthStore, err := oauthservice.NewRedisStore(redisOptions, cfg.OAuthRedisKeyPrefix)
+			if err != nil {
+				logger.Error("initialize oauth redis store", "error", err)
+				os.Exit(1)
+			}
+			defer func() {
+				if err := redisOAuthStore.Close(); err != nil {
+					logger.Error("close oauth redis store", "error", err)
+				}
+			}()
+			oauthStore = redisOAuthStore
+		} else {
+			oauthStore = oauthservice.NewMemoryStore()
+		}
+		oauthService, err := oauthservice.NewService(oauthservice.ServiceOptions{
+			Registry:             registry,
+			Store:                oauthStore,
+			Sessions:             store,
+			Signer:               signer,
+			Issuer:               cfg.OAuthIssuer,
+			CookieName:           cfg.SessionCookieName,
+			LoginURL:             cfg.OAuthLoginURL,
+			IdleTTL:              cfg.IdleTTL,
+			AbsoluteTTL:          cfg.AbsoluteTTL,
+			CodeTTL:              cfg.OAuthCodeTTL,
+			ConsentTTL:           cfg.OAuthConsentTTL,
+			RequiredEntitlements: cfg.OAuthRequiredEntitlements,
+		})
+		if err != nil {
+			logger.Error("initialize oauth service", "error", err)
+			os.Exit(1)
+		}
+		api.WithOAuth(oauthservice.NewHandler(oauthService, logger))
+		logger.Info("oauth authorization server enabled",
+			"issuer", cfg.OAuthIssuer,
+			"client_id", cfg.OAuthClientID,
+		)
 	}
 	server := &http.Server{
 		Addr:              cfg.Addr,

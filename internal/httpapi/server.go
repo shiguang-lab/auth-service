@@ -19,6 +19,7 @@ import (
 	"github.com/shiguanglab/auth-service/internal/identity"
 	"github.com/shiguanglab/auth-service/internal/localidentity"
 	loginservice "github.com/shiguanglab/auth-service/internal/login"
+	oauthservice "github.com/shiguanglab/auth-service/internal/oauth"
 	orgservice "github.com/shiguanglab/auth-service/internal/orgs"
 	"github.com/shiguanglab/auth-service/internal/platformroleadmin"
 	"github.com/shiguanglab/auth-service/internal/session"
@@ -44,6 +45,7 @@ type Server struct {
 	productRoleAdmin *platformroleadmin.Service
 	localIdentity    *localidentity.Service
 	localBrokers     map[string]LocalBrokerPolicy
+	oauth            *oauthservice.Handler
 }
 
 type LocalBrokerPolicy struct {
@@ -88,6 +90,13 @@ func (s *Server) WithOrganizations(orgs *orgservice.Service) *Server {
 	return s
 }
 
+// WithOAuth attaches the OAuth 2.0 authorization server. Routes stay unmounted
+// until a handler is supplied, so existing deployments are unaffected.
+func (s *Server) WithOAuth(handler *oauthservice.Handler) *Server {
+	s.oauth = handler
+	return s
+}
+
 func NewServer(
 	decision *authorize.Service,
 	signer *identity.Signer,
@@ -122,6 +131,17 @@ func (s *Server) Handler() http.Handler {
 	router.Get("/health/live", writeOK)
 	router.Get("/health/ready", s.handleReady)
 	router.Get("/.well-known/jwks.json", s.handleJWKS)
+	// The OAuth 2.0 authorization server is intentionally mounted outside the
+	// gateway middleware: a native client cannot present the shared gateway
+	// token. These endpoints protect themselves with PKCE, strict redirect URI
+	// validation and the user's own session cookie.
+	if s.oauth != nil {
+		router.Get("/.well-known/oauth-authorization-server", s.oauth.Metadata)
+		router.Get("/oauth/authorize", s.oauth.Authorize)
+		router.Post("/oauth/authorize", s.oauth.ConsentSubmit)
+		router.Post("/oauth/token", s.oauth.Token)
+		router.Post("/oauth/revoke", s.oauth.Revoke)
+	}
 	router.With(s.authenticateGateway).Get("/v1/forward-auth", s.handleForwardAuth)
 	router.With(s.authenticateGateway).Post("/v1/authorize", s.handleAuthorize)
 	// The console host uses this same-origin exchange to obtain the

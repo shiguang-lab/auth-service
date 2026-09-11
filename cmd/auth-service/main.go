@@ -189,15 +189,17 @@ func main() {
 		api.WithOrganizations(orgservice.NewService(cfg, store, login, directory, logger))
 	}
 	if cfg.OAuthEnabled {
-		registry, err := oauthservice.NewRegistry([]oauthservice.ClientPolicy{{
-			ClientID:     cfg.OAuthClientID,
-			Name:         cfg.OAuthClientName,
-			RedirectURIs: cfg.OAuthClientRedirectURIs,
-			Scopes:       cfg.OAuthClientScopes,
-			Audience:     cfg.OAuthClientAudience,
-			AccessTTL:    cfg.OAuthAccessTokenTTL,
-			RefreshTTL:   cfg.OAuthRefreshTokenTTL,
-		}})
+		configuredClients := cfg.EffectiveOAuthClients()
+		clientPolicies := make([]oauthservice.ClientPolicy, 0, len(configuredClients))
+		for _, client := range configuredClients {
+			clientPolicies = append(clientPolicies, oauthservice.ClientPolicy{
+				ClientID: client.ClientID, Name: client.Name, RedirectURIs: client.RedirectURIs,
+				Scopes: client.Scopes, Audience: client.Audience, WebAppURL: client.WebAppURL,
+				RequiredEntitlements: client.RequiredEntitlements,
+				AccessTTL:            cfg.OAuthAccessTokenTTL, RefreshTTL: cfg.OAuthRefreshTokenTTL,
+			})
+		}
+		registry, err := oauthservice.NewRegistry(clientPolicies)
 		if err != nil {
 			logger.Error("initialize oauth client registry", "error", err)
 			os.Exit(1)
@@ -225,7 +227,9 @@ func main() {
 			Signer:               signer,
 			Issuer:               cfg.OAuthIssuer,
 			CookieName:           cfg.SessionCookieName,
+			CookieDomain:         cfg.SessionCookieDomain,
 			LoginURL:             cfg.OAuthLoginURL,
+			WebAppURL:            cfg.OAuthWebAppURL,
 			IdleTTL:              cfg.IdleTTL,
 			AbsoluteTTL:          cfg.AbsoluteTTL,
 			CodeTTL:              cfg.OAuthCodeTTL,
@@ -239,7 +243,7 @@ func main() {
 		api.WithOAuth(oauthservice.NewHandler(oauthService, logger))
 		logger.Info("oauth authorization server enabled",
 			"issuer", cfg.OAuthIssuer,
-			"client_id", cfg.OAuthClientID,
+			"clients", len(clientPolicies),
 		)
 	}
 	server := &http.Server{

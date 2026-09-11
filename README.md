@@ -98,6 +98,13 @@ production startup keeps the IAM writer nil and fail-closed.
 | `GET` | `/health/live` | Public |
 | `GET` | `/health/ready` | Public |
 | `GET` | `/.well-known/jwks.json` | Public |
+| `GET` | `/.well-known/oauth-authorization-server` | Public OAuth metadata |
+| `POST` | `/oauth/device/authorize` | Public OAuth device request |
+| `GET`, `POST` | `/oauth/device` | Website session; device confirmation |
+| `POST` | `/oauth/token` | OAuth grant credential |
+| `POST` | `/oauth/revoke` | Public, idempotent token revocation |
+| `POST` | `/oauth/web-session-ticket` | OAuth bearer with `web:session` |
+| `GET` | `/oauth/web-session` | Single-use Web session ticket |
 | `POST` | `/v1/authorize` | `X-SG-Gateway-Token`; strict JSON decision protocol |
 | `GET` | `/v1/forward-auth` | `X-SG-Gateway-Token`; compatibility adapter only |
 | `GET` | `/api/auth/federated/start` | Gateway token; federated login only |
@@ -124,6 +131,13 @@ It accepts a bounded JSON `authorize.Request` with unknown fields rejected and
 returns an `authorize.Response` for allow, deny, and login-redirect decisions.
 The shared credential is accepted only in `X-SG-Gateway-Token`; bearer auth is
 not part of this protocol.
+
+OAuth clients are resolved through the shared registry. Existing deployments
+may keep the `OAUTH_CLIENT_*` variables. Set `OAUTH_CLIENTS_JSON` to a JSON array
+to register several native applications; the device confirmation page reads the
+registered client name and scopes dynamically and contains no app-specific flow.
+Each client owns its scopes, API audience, optional web-session target and
+required entitlements. Device-only clients do not need a redirect URI.
 
 The compatibility forward-auth endpoint consumes the standard `X-Forwarded-Method`,
 `X-Forwarded-Uri`, `X-Forwarded-Host`, and `X-Forwarded-Proto` headers plus

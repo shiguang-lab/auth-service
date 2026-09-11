@@ -315,7 +315,7 @@ func TestOAuthDefaultsAreUsableWhenEnabled(t *testing.T) {
 	if cfg.OAuthLoginURL != cfg.PublicOrigin+"/login" {
 		t.Fatalf("login url = %q", cfg.OAuthLoginURL)
 	}
-	if !slices.Equal(cfg.OAuthClientRedirectURIs, []string{"http://127.0.0.1/callback", "http://[::1]/callback"}) {
+	if len(cfg.OAuthClientRedirectURIs) != 0 {
 		t.Fatalf("redirect uris = %#v", cfg.OAuthClientRedirectURIs)
 	}
 	if cfg.OAuthAccessTokenTTL != 15*time.Minute || cfg.OAuthRefreshTokenTTL != 30*24*time.Hour {
@@ -325,7 +325,7 @@ func TestOAuthDefaultsAreUsableWhenEnabled(t *testing.T) {
 
 func TestOAuthValidationRejectsUnsafeConfiguration(t *testing.T) {
 	cases := map[string]func(*Config){
-		"unknown scope": func(c *Config) { c.OAuthClientScopes = []string{"documents:admin"} },
+		"malformed scope": func(c *Config) { c.OAuthClientScopes = []string{"documents admin"} },
 		"long access ttl": func(c *Config) {
 			c.OAuthAccessTokenTTL = 2 * time.Hour
 		},
@@ -362,5 +362,36 @@ func TestOAuthValidationRejectsUnsafeConfiguration(t *testing.T) {
 				t.Fatal("expected the configuration to be rejected")
 			}
 		})
+	}
+}
+
+func TestOAuthClientsJSONSupportsIndependentNativeApps(t *testing.T) {
+	clients, err := parseOAuthClients(`[
+		{"clientId":"obsidian-asset-hub","name":"知序 for Obsidian","scopes":["documents:read","web:session"],"audience":"asset-hub-api","webAppUrl":"https://doc.shiguanglab.com","requiredEntitlements":["asset-hub:access"]},
+		{"clientId":"desktop-notes","name":"拾光桌面端","scopes":["notes:read","offline_access"],"audience":"notes-api","requiredEntitlements":["notes:access"]}
+	]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := oauthBaseConfig()
+	cfg.OAuthEnabled = true
+	cfg.OAuthIssuer = "https://shiguanglab.com"
+	cfg.OAuthLoginURL = "https://shiguanglab.com/login"
+	cfg.OAuthClients = clients
+	cfg.OAuthAccessTokenTTL = 15 * time.Minute
+	cfg.OAuthRefreshTokenTTL = 30 * 24 * time.Hour
+	cfg.OAuthCodeTTL = time.Minute
+	cfg.OAuthConsentTTL = 10 * time.Minute
+	cfg.OAuthRedisKeyPrefix = "auth:oauth:"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate multi-client device configuration: %v", err)
+	}
+	if got := cfg.EffectiveOAuthClients(); len(got) != 2 || got[1].ClientID != "desktop-notes" {
+		t.Fatalf("effective clients = %#v", got)
+	}
+
+	cfg.OAuthClients = append(cfg.OAuthClients, cfg.OAuthClients[0])
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "duplicate OAuth client") {
+		t.Fatalf("expected duplicate client error, got %v", err)
 	}
 }

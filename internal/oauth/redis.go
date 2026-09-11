@@ -83,6 +83,127 @@ func (s *RedisStore) TakePending(ctx context.Context, id string) (PendingAuthori
 	return value, nil
 }
 
+func (s *RedisStore) PutDevice(ctx context.Context, value DeviceAuthorization, ttl time.Duration) error {
+	if value.DeviceCode == "" || value.UserCode == "" {
+		return errors.New("device and user codes are required")
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	pipe := s.client.TxPipeline()
+	pipe.Set(ctx, s.deviceKey(value.DeviceCode), encoded, ttl)
+	pipe.Set(ctx, s.deviceUserKey(value.UserCode), value.DeviceCode, ttl)
+	_, err = pipe.Exec(ctx)
+	return err
+}
+
+func (s *RedisStore) Device(ctx context.Context, code string) (DeviceAuthorization, error) {
+	var value DeviceAuthorization
+	raw, err := s.client.Get(ctx, s.deviceKey(code)).Result()
+	if errors.Is(err, redis.Nil) {
+		return value, ErrDeviceNotFound
+	}
+	if err != nil {
+		return value, err
+	}
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		return value, err
+	}
+	return value, nil
+}
+
+func (s *RedisStore) DeviceByUserCode(ctx context.Context, userCode string) (DeviceAuthorization, error) {
+	code, err := s.client.Get(ctx, s.deviceUserKey(userCode)).Result()
+	if errors.Is(err, redis.Nil) {
+		return DeviceAuthorization{}, ErrDeviceNotFound
+	}
+	if err != nil {
+		return DeviceAuthorization{}, err
+	}
+	return s.Device(ctx, code)
+}
+
+func (s *RedisStore) UpdateDevice(ctx context.Context, value DeviceAuthorization) error {
+	key := s.deviceKey(value.DeviceCode)
+	err := s.client.Watch(ctx, func(tx *redis.Tx) error {
+		raw, err := tx.Get(ctx, key).Result()
+		if errors.Is(err, redis.Nil) {
+			return ErrDeviceNotFound
+		}
+		if err != nil {
+			return err
+		}
+		var current DeviceAuthorization
+		if err := json.Unmarshal([]byte(raw), &current); err != nil {
+			return err
+		}
+		if current.Approved || current.Denied {
+			return ErrInvalidGrant
+		}
+		ttl, err := tx.PTTL(ctx, key).Result()
+		if err != nil || ttl <= 0 {
+			return ErrDeviceNotFound
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.Set(ctx, key, encoded, ttl)
+			return nil
+		})
+		return err
+	}, key)
+	if errors.Is(err, redis.TxFailedErr) {
+		return ErrInvalidGrant
+	}
+	return err
+}
+
+func (s *RedisStore) TakeDevice(ctx context.Context, code string) (DeviceAuthorization, error) {
+	var value DeviceAuthorization
+	if err := s.take(ctx, s.deviceKey(code), &value); err != nil {
+		if errors.Is(err, redis.Nil) {
+			return value, ErrDeviceNotFound
+		}
+		return value, err
+	}
+	_ = s.client.Del(ctx, s.deviceUserKey(value.UserCode)).Err()
+	return value, nil
+}
+
+func (s *RedisStore) PutAccessBinding(ctx context.Context, hash string, value SessionBinding, ttl time.Duration) error {
+	return s.put(ctx, s.bindingKey(hash), value, ttl)
+}
+func (s *RedisStore) AccessBinding(ctx context.Context, hash string) (SessionBinding, error) {
+	var value SessionBinding
+	raw, err := s.client.Get(ctx, s.bindingKey(hash)).Result()
+	if errors.Is(err, redis.Nil) {
+		return value, ErrInvalidGrant
+	}
+	if err != nil {
+		return value, err
+	}
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		return value, err
+	}
+	return value, nil
+}
+func (s *RedisStore) PutWebTicket(ctx context.Context, ticket string, value WebSessionTicket, ttl time.Duration) error {
+	return s.put(ctx, s.ticketKey(ticket), value, ttl)
+}
+func (s *RedisStore) TakeWebTicket(ctx context.Context, ticket string) (WebSessionTicket, error) {
+	var value WebSessionTicket
+	if err := s.take(ctx, s.ticketKey(ticket), &value); err != nil {
+		if errors.Is(err, redis.Nil) {
+			return value, ErrInvalidGrant
+		}
+		return value, err
+	}
+	return value, nil
+}
+
 func (s *RedisStore) PutRefresh(ctx context.Context, value RefreshToken, ttl time.Duration) error {
 	if strings.TrimSpace(value.TokenHash) == "" {
 		return errors.New("refresh token hash is required")
@@ -208,3 +329,9 @@ func (s *RedisStore) pendingKey(id string) string   { return s.keyPrefix + "pend
 func (s *RedisStore) refreshKey(hash string) string { return s.keyPrefix + "refresh:" + hash }
 func (s *RedisStore) usedKey(hash string) string    { return s.keyPrefix + "used:" + hash }
 func (s *RedisStore) familyKey(id string) string    { return s.keyPrefix + "family:" + id }
+func (s *RedisStore) deviceKey(id string) string    { return s.keyPrefix + "device:" + id }
+func (s *RedisStore) deviceUserKey(id string) string {
+	return s.keyPrefix + "device-user:" + strings.ToUpper(id)
+}
+func (s *RedisStore) bindingKey(id string) string { return s.keyPrefix + "access-binding:" + id }
+func (s *RedisStore) ticketKey(id string) string  { return s.keyPrefix + "web-ticket:" + id }

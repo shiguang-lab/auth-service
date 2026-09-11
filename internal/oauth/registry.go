@@ -17,14 +17,13 @@ const ClientTypePublic = "public"
 const (
 	ScopeDocumentsRead  = "documents:read"
 	ScopeDocumentsWrite = "documents:write"
+	ScopeWebSession     = "web:session"
 	ScopeOfflineAccess  = "offline_access"
 )
 
 const redirectPath = "/callback"
 
-// ClientPolicy is one registered OAuth client. Registration is static
-// configuration rather than a database table: the deployment ships a single
-// first-party public client and offers no self-service registration.
+// ClientPolicy is one statically registered first-party OAuth client.
 //
 // RedirectURIs are templates rather than literals. Each pins scheme, host and
 // path but may leave the port out, in which case any port is accepted. RFC 8252
@@ -41,6 +40,10 @@ type ClientPolicy struct {
 	Audience     string
 	AccessTTL    time.Duration
 	RefreshTTL   time.Duration
+	// RequiredEntitlements must all be present before this client can be approved.
+	RequiredEntitlements []string
+	// WebAppURL is the only origin this client may target during a web-session handoff.
+	WebAppURL string
 
 	redirects []redirectTarget
 }
@@ -65,8 +68,10 @@ func NewRegistry(policies []ClientPolicy) (*Registry, error) {
 		policy.ClientID = strings.TrimSpace(policy.ClientID)
 		policy.Name = strings.TrimSpace(policy.Name)
 		policy.Audience = strings.TrimSpace(policy.Audience)
+		policy.WebAppURL = strings.TrimRight(strings.TrimSpace(policy.WebAppURL), "/")
 		policy.RedirectURIs = trimAll(policy.RedirectURIs)
 		policy.Scopes = trimAll(policy.Scopes)
+		policy.RequiredEntitlements = trimAll(policy.RequiredEntitlements)
 
 		if policy.ClientID == "" {
 			return nil, errors.New("oauth client id is required")
@@ -94,9 +99,6 @@ func NewRegistry(policies []ClientPolicy) (*Registry, error) {
 		}
 		if policy.RefreshTTL <= 0 {
 			return nil, fmt.Errorf("oauth client %q: refresh token TTL must be positive", policy.ClientID)
-		}
-		if len(policy.RedirectURIs) == 0 {
-			return nil, fmt.Errorf("oauth client %q: at least one redirect URI is required", policy.ClientID)
 		}
 		for _, candidate := range policy.RedirectURIs {
 			target, err := parseRedirectTemplate(candidate)

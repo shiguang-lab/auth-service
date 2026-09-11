@@ -24,6 +24,16 @@ type LocalBrokerProductPolicy struct {
 	RequiredEntitlements []string `json:"requiredEntitlements"`
 }
 
+type OAuthClientPolicy struct {
+	ClientID             string   `json:"clientId"`
+	Name                 string   `json:"name"`
+	RedirectURIs         []string `json:"redirectUris"`
+	Scopes               []string `json:"scopes"`
+	Audience             string   `json:"audience"`
+	WebAppURL            string   `json:"webAppUrl"`
+	RequiredEntitlements []string `json:"requiredEntitlements"`
+}
+
 type Config struct {
 	// S3Endpoint is the MinIO/S3-compatible endpoint (host:port).
 	S3Endpoint string
@@ -87,6 +97,7 @@ type Config struct {
 	OAuthEnabled              bool
 	OAuthIssuer               string
 	OAuthLoginURL             string
+	OAuthWebAppURL            string
 	OAuthClientID             string
 	OAuthClientName           string
 	OAuthClientRedirectURIs   []string
@@ -98,6 +109,7 @@ type Config struct {
 	OAuthConsentTTL           time.Duration
 	OAuthRequiredEntitlements []string
 	OAuthRedisKeyPrefix       string
+	OAuthClients              []OAuthClientPolicy
 }
 
 func Load() (Config, error) {
@@ -133,6 +145,10 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	localBrokerPolicies, err := parseLocalBrokerPolicies(os.Getenv("LOCAL_BROKER_POLICIES"))
+	if err != nil {
+		return Config{}, err
+	}
+	oauthClients, err := parseOAuthClients(os.Getenv("OAUTH_CLIENTS_JSON"))
 	if err != nil {
 		return Config{}, err
 	}
@@ -207,10 +223,11 @@ func Load() (Config, error) {
 		OAuthEnabled:               strings.EqualFold(strings.TrimSpace(os.Getenv("OAUTH_ENABLED")), "true"),
 		OAuthIssuer:                strings.TrimRight(strings.TrimSpace(os.Getenv("OAUTH_ISSUER")), "/"),
 		OAuthLoginURL:              strings.TrimSpace(os.Getenv("OAUTH_LOGIN_URL")),
+		OAuthWebAppURL:             strings.TrimRight(envOr("OAUTH_WEB_APP_URL", "https://doc.shiguanglab.com"), "/"),
 		OAuthClientID:              envOr("OAUTH_CLIENT_ID", "obsidian-asset-hub"),
 		OAuthClientName:            envOr("OAUTH_CLIENT_NAME", "知序资产中心 for Obsidian"),
-		OAuthClientRedirectURIs:    splitCSV(envOr("OAUTH_CLIENT_REDIRECT_URIS", "http://127.0.0.1/callback,http://[::1]/callback")),
-		OAuthClientScopes:          splitCSV(envOr("OAUTH_CLIENT_SCOPES", "documents:read,documents:write,offline_access")),
+		OAuthClientRedirectURIs:    splitCSV(os.Getenv("OAUTH_CLIENT_REDIRECT_URIS")),
+		OAuthClientScopes:          splitCSV(envOr("OAUTH_CLIENT_SCOPES", "documents:read,documents:write,web:session,offline_access")),
 		OAuthClientAudience:        envOr("OAUTH_CLIENT_AUDIENCE", "asset-hub-api"),
 		OAuthAccessTokenTTL:        oauthAccessTokenTTL,
 		OAuthRefreshTokenTTL:       oauthRefreshTokenTTL,
@@ -218,6 +235,7 @@ func Load() (Config, error) {
 		OAuthConsentTTL:            oauthConsentTTL,
 		OAuthRequiredEntitlements:  splitCSV(envOr("OAUTH_REQUIRED_ENTITLEMENTS", "asset-hub:access")),
 		OAuthRedisKeyPrefix:        envOr("OAUTH_REDIS_KEY_PREFIX", "auth:oauth:"),
+		OAuthClients:               oauthClients,
 	}
 	if cfg.OAuthIssuer == "" {
 		cfg.OAuthIssuer = cfg.PublicOrigin
@@ -231,21 +249,9 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
-// oauthKnownScopes is the closed set the authorization server can grant.
-var oauthKnownScopes = []string{"documents:read", "documents:write", "offline_access"}
-
 func (c Config) validateOAuth() error {
 	if !c.OAuthEnabled {
 		return nil
-	}
-	if !providerTokenPattern.MatchString(c.OAuthClientID) {
-		return errors.New("OAUTH_CLIENT_ID must be a plain token")
-	}
-	if len(c.OAuthClientRedirectURIs) == 0 {
-		return errors.New("OAUTH_CLIENT_REDIRECT_URIS must list at least one redirect URI")
-	}
-	if c.OAuthClientAudience == "" {
-		return errors.New("OAUTH_CLIENT_AUDIENCE is required")
 	}
 	if !isAbsoluteURL(c.OAuthIssuer, c.Environment) {
 		return errors.New("OAUTH_ISSUER must be an absolute http(s) URL")
@@ -253,16 +259,45 @@ func (c Config) validateOAuth() error {
 	if !isAbsoluteURL(c.OAuthLoginURL, c.Environment) {
 		return errors.New("OAUTH_LOGIN_URL must be an absolute http(s) URL")
 	}
-	if len(c.OAuthClientScopes) == 0 {
-		return errors.New("OAUTH_CLIENT_SCOPES must list at least one scope")
+	clients := c.EffectiveOAuthClients()
+	if len(clients) == 0 {
+		return errors.New("at least one OAuth client must be configured")
 	}
-	for _, scope := range c.OAuthClientScopes {
-		if !contains(oauthKnownScopes, scope) {
-			return fmt.Errorf("unsupported OAuth scope %q", scope)
+	seenClients := make(map[string]struct{}, len(clients))
+	for _, client := range clients {
+		if !providerTokenPattern.MatchString(client.ClientID) {
+			return fmt.Errorf("OAuth client %q must have a plain clientId", client.ClientID)
 		}
-	}
-	if len(c.OAuthRequiredEntitlements) == 0 {
-		return errors.New("OAUTH_REQUIRED_ENTITLEMENTS must list at least one entitlement")
+		if _, duplicate := seenClients[client.ClientID]; duplicate {
+			return fmt.Errorf("duplicate OAuth client %q", client.ClientID)
+		}
+		seenClients[client.ClientID] = struct{}{}
+		if client.Audience == "" {
+			return fmt.Errorf("OAuth client %q audience is required", client.ClientID)
+		}
+		if client.WebAppURL != "" && !isAbsoluteURL(client.WebAppURL, c.Environment) {
+			return fmt.Errorf("OAuth client %q webAppUrl must be absolute", client.ClientID)
+		}
+		if len(client.Scopes) == 0 {
+			return fmt.Errorf("OAuth client %q must list at least one scope", client.ClientID)
+		}
+		for _, scope := range client.Scopes {
+			if !entitlementTokenPattern.MatchString(scope) {
+				return fmt.Errorf("invalid OAuth scope %q", scope)
+			}
+		}
+		for _, entitlement := range client.RequiredEntitlements {
+			if !entitlementTokenPattern.MatchString(entitlement) {
+				return fmt.Errorf("invalid OAuth client entitlement %q", entitlement)
+			}
+		}
+		requiredEntitlements := client.RequiredEntitlements
+		if len(requiredEntitlements) == 0 {
+			requiredEntitlements = c.OAuthRequiredEntitlements
+		}
+		if len(requiredEntitlements) == 0 {
+			return fmt.Errorf("OAuth client %q must require at least one entitlement", client.ClientID)
+		}
 	}
 	for _, entitlement := range c.OAuthRequiredEntitlements {
 		if !entitlementTokenPattern.MatchString(entitlement) {
@@ -285,6 +320,18 @@ func (c Config) validateOAuth() error {
 		return errors.New("OAUTH_REDIS_KEY_PREFIX must end with a colon")
 	}
 	return nil
+}
+
+func (c Config) EffectiveOAuthClients() []OAuthClientPolicy {
+	if len(c.OAuthClients) > 0 {
+		return append([]OAuthClientPolicy(nil), c.OAuthClients...)
+	}
+	return []OAuthClientPolicy{{
+		ClientID: c.OAuthClientID, Name: c.OAuthClientName,
+		RedirectURIs: c.OAuthClientRedirectURIs, Scopes: c.OAuthClientScopes,
+		Audience: c.OAuthClientAudience, WebAppURL: c.OAuthWebAppURL,
+		RequiredEntitlements: c.OAuthRequiredEntitlements,
+	}}
 }
 
 func isAbsoluteURL(value, environment string) bool {
@@ -461,6 +508,26 @@ func parseLocalBrokerPolicies(raw string) ([]LocalBrokerProductPolicy, error) {
 		return nil, errors.New("parse LOCAL_BROKER_POLICIES: one JSON array is required")
 	}
 	return policies, nil
+}
+
+func parseOAuthClients(raw string) ([]OAuthClientPolicy, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	var clients []OAuthClientPolicy
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&clients); err != nil {
+		return nil, fmt.Errorf("parse OAUTH_CLIENTS_JSON: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, errors.New("parse OAUTH_CLIENTS_JSON: one JSON array is required")
+	}
+	if clients == nil {
+		return nil, errors.New("parse OAUTH_CLIENTS_JSON: a JSON array is required")
+	}
+	return clients, nil
 }
 func contains(values []string, expected string) bool {
 	for _, value := range values {

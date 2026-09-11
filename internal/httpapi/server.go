@@ -139,6 +139,13 @@ func (s *Server) Handler() http.Handler {
 		router.Get("/.well-known/oauth-authorization-server", s.oauth.Metadata)
 		router.Get("/oauth/authorize", s.oauth.Authorize)
 		router.Post("/oauth/authorize", s.oauth.ConsentSubmit)
+		router.Post("/oauth/device/authorize", s.oauth.DeviceAuthorize)
+		router.Get("/oauth/device/context", s.oauth.DeviceContext)
+		router.Post("/oauth/device/decision", s.oauth.DeviceDecision)
+		router.Get("/oauth/device", s.oauth.DeviceVerification)
+		router.Post("/oauth/device", s.oauth.DeviceVerificationSubmit)
+		router.Post("/oauth/web-session-ticket", s.oauth.WebSessionTicket)
+		router.Get("/oauth/web-session", s.oauth.WebSession)
 		router.Post("/oauth/token", s.oauth.Token)
 		router.Post("/oauth/revoke", s.oauth.Revoke)
 	}

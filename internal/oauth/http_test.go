@@ -190,6 +190,60 @@ func TestTokenEndpointRejectsUnknownGrantType(t *testing.T) {
 	}
 }
 
+func TestWebsiteDeviceContextAndDecisionContract(t *testing.T) {
+	handler, h := newTestHandler(t)
+	h.seedSession(t, "sess-website", testSubject, []string{testEntitle})
+	started, err := h.service.StartDeviceAuthorization(t.Context(), testClientID, "documents:read offline_access")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	contextRequest := httptest.NewRequest(http.MethodGet, "/oauth/device/context?"+url.Values{"user_code": {started.UserCode}}.Encode(), nil)
+	contextRequest.Header.Set("Cookie", cookieFor("sess-website"))
+	contextResponse := httptest.NewRecorder()
+	handler.DeviceContext(contextResponse, contextRequest)
+	if contextResponse.Code != http.StatusOK {
+		t.Fatalf("context status = %d body=%s", contextResponse.Code, contextResponse.Body.String())
+	}
+	var contextBody struct {
+		UserCode   string        `json:"user_code"`
+		ClientName string        `json:"client_name"`
+		Scopes     []ScopePrompt `json:"scopes"`
+	}
+	if err := json.Unmarshal(contextResponse.Body.Bytes(), &contextBody); err != nil {
+		t.Fatal(err)
+	}
+	if contextBody.UserCode != started.UserCode || contextBody.ClientName != "知序资产中心 for Obsidian" || len(contextBody.Scopes) != 2 {
+		t.Fatalf("context body = %#v", contextBody)
+	}
+
+	form := url.Values{"user_code": {started.UserCode}, "decision": {"allow"}}
+	decisionRequest := httptest.NewRequest(http.MethodPost, "/oauth/device/decision", strings.NewReader(form.Encode()))
+	decisionRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	decisionRequest.Header.Set("Cookie", cookieFor("sess-website"))
+	decisionRequest.Header.Set("Origin", "https://shiguanglab.com")
+	decisionResponse := httptest.NewRecorder()
+	handler.DeviceDecision(decisionResponse, decisionRequest)
+	if decisionResponse.Code != http.StatusOK || !strings.Contains(decisionResponse.Body.String(), `"status":"approved"`) {
+		t.Fatalf("decision status = %d body=%s", decisionResponse.Code, decisionResponse.Body.String())
+	}
+	if _, err := h.service.ExchangeDevice(t.Context(), started.DeviceCode, testClientID); err != nil {
+		t.Fatalf("approved device grant cannot be exchanged: %v", err)
+	}
+}
+
+func TestWebsiteDeviceDecisionRejectsCrossSiteRequest(t *testing.T) {
+	handler, _ := newTestHandler(t)
+	request := httptest.NewRequest(http.MethodPost, "/oauth/device/decision", strings.NewReader("user_code=ABCD-EFGH&decision=allow"))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", "https://example.com")
+	response := httptest.NewRecorder()
+	handler.DeviceDecision(response, request)
+	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), `"error":"invalid_origin"`) {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+}
+
 // RFC 7009: an unknown token still returns 200 so the endpoint cannot be used
 // to probe for valid tokens.
 func TestRevokeIsIdempotentForUnknownTokens(t *testing.T) {

@@ -115,11 +115,6 @@ func TestRegistryRejectsInvalidConfiguration(t *testing.T) {
 			policy.AccessTTL = 0
 			return policy
 		}(),
-		"no redirect uris": func() ClientPolicy {
-			policy := testPolicy(t, "http://127.0.0.1/callback")
-			policy.RedirectURIs = nil
-			return policy
-		}(),
 	}
 	for name, policy := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -127,6 +122,22 @@ func TestRegistryRejectsInvalidConfiguration(t *testing.T) {
 				t.Fatal("expected configuration to be rejected")
 			}
 		})
+	}
+}
+
+func TestRegistryAcceptsDeviceOnlyClientWithoutRedirectURI(t *testing.T) {
+	policy := testPolicy(t, "http://127.0.0.1/callback")
+	policy.RedirectURIs = nil
+	registry, err := NewRegistry([]ClientPolicy{policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registered, ok := registry.Client(policy.ClientID)
+	if !ok || len(registered.RedirectURIs) != 0 {
+		t.Fatalf("registered policy = %#v", registered)
+	}
+	if err := registry.ValidateRedirectURI(registered, "http://127.0.0.1:27123/callback"); err == nil {
+		t.Fatal("a device-only client must still be rejected by the authorization-code flow")
 	}
 }
 

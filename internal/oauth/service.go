@@ -21,16 +21,21 @@ import (
 // into ErrInvalidGrant by the handler so responses never disclose which check
 // failed.
 var (
-	ErrInvalidGrant  = errors.New("invalid_grant")
-	ErrInvalidClient = errors.New("invalid_client")
-	ErrNoSession     = errors.New("no active session")
-	ErrMissingScope  = errors.New("missing entitlement")
+	ErrInvalidGrant         = errors.New("invalid_grant")
+	ErrInvalidClient        = errors.New("invalid_client")
+	ErrNoSession            = errors.New("no active session")
+	ErrMissingScope         = errors.New("missing entitlement")
+	ErrAuthorizationPending = errors.New("authorization_pending")
+	ErrAccessDenied         = errors.New("access_denied")
+	ErrExpiredToken         = errors.New("expired_token")
 )
 
 const (
 	codeEntropyBytes    = 32
 	refreshEntropyBytes = 48
 	pendingEntropyBytes = 32
+	deviceTTL           = 10 * time.Minute
+	devicePollInterval  = 5
 	minVerifierLength   = 43
 	maxVerifierLength   = 128
 )
@@ -39,21 +44,40 @@ const (
 var ScopeDescriptions = map[string]string{
 	ScopeDocumentsRead:  "读取你的文档中心内容",
 	ScopeDocumentsWrite: "创建、修改和删除你的文档",
+	ScopeWebSession:     "在应用内打开已登录的拾光页面",
 	ScopeOfflineAccess:  "在你关闭浏览器后仍保持登录（长期访问）",
 }
 
+type DeviceAuthorizationResponse struct {
+	DeviceCode              string `json:"device_code"`
+	UserCode                string `json:"user_code"`
+	VerificationURI         string `json:"verification_uri"`
+	VerificationURIComplete string `json:"verification_uri_complete"`
+	ExpiresIn               int    `json:"expires_in"`
+	Interval                int    `json:"interval"`
+}
+
+type DevicePrompt struct {
+	UserCode   string
+	ClientName string
+	Scopes     []ScopePrompt
+	Redirect   string
+}
+
 type ServiceOptions struct {
-	Registry    *Registry
-	Store       Store
-	Sessions    session.Store
-	Signer      *identity.Signer
-	Issuer      string
-	CookieName  string
-	LoginURL    string
-	IdleTTL     time.Duration
-	AbsoluteTTL time.Duration
-	CodeTTL     time.Duration
-	ConsentTTL  time.Duration
+	Registry     *Registry
+	Store        Store
+	Sessions     session.Store
+	Signer       *identity.Signer
+	Issuer       string
+	CookieName   string
+	CookieDomain string
+	LoginURL     string
+	WebAppURL    string
+	IdleTTL      time.Duration
+	AbsoluteTTL  time.Duration
+	CodeTTL      time.Duration
+	ConsentTTL   time.Duration
 	// RequiredEntitlements must all be present on the user's session before a
 	// scope can be granted.
 	RequiredEntitlements []string
@@ -66,7 +90,9 @@ type Service struct {
 	signer               *identity.Signer
 	issuer               string
 	cookieName           string
+	cookieDomain         string
 	loginURL             string
+	webAppURL            string
 	idleTTL              time.Duration
 	absoluteTTL          time.Duration
 	codeTTL              time.Duration
@@ -110,7 +136,9 @@ func NewService(options ServiceOptions) (*Service, error) {
 		signer:               options.Signer,
 		issuer:               options.Issuer,
 		cookieName:           options.CookieName,
+		cookieDomain:         options.CookieDomain,
 		loginURL:             options.LoginURL,
+		webAppURL:            strings.TrimRight(options.WebAppURL, "/"),
 		idleTTL:              options.IdleTTL,
 		absoluteTTL:          options.AbsoluteTTL,
 		codeTTL:              options.CodeTTL,
@@ -118,6 +146,60 @@ func NewService(options ServiceOptions) (*Service, error) {
 		requiredEntitlements: append([]string(nil), options.RequiredEntitlements...),
 		now:                  time.Now,
 	}, nil
+}
+
+type WebSessionResponse struct {
+	URL       string `json:"url"`
+	ExpiresIn int    `json:"expires_in"`
+}
+
+func (s *Service) CreateWebSessionTicket(ctx context.Context, accessToken, returnTo string) (WebSessionResponse, error) {
+	binding, err := s.store.AccessBinding(ctx, hashToken(accessToken))
+	if err != nil {
+		return WebSessionResponse{}, ErrInvalidGrant
+	}
+	if _, err := s.sessionByID(ctx, binding.SessionCredential); err != nil {
+		return WebSessionResponse{}, ErrInvalidGrant
+	}
+	policy, ok := s.registry.Client(binding.ClientID)
+	if !ok {
+		return WebSessionResponse{}, ErrInvalidGrant
+	}
+	base := policy.WebAppURL
+	if base == "" {
+		base = s.webAppURL
+	}
+	if strings.TrimSpace(returnTo) == "" {
+		returnTo = base + "/"
+	}
+	parsed, err := url.Parse(returnTo)
+	if err != nil {
+		return WebSessionResponse{}, ErrInvalidGrant
+	}
+	expected, err := url.Parse(base)
+	if err != nil || parsed.Scheme != expected.Scheme || parsed.Host != expected.Host {
+		return WebSessionResponse{}, ErrInvalidGrant
+	}
+	ticket, err := randomToken(32)
+	if err != nil {
+		return WebSessionResponse{}, err
+	}
+	const ttl = time.Minute
+	if err := s.store.PutWebTicket(ctx, ticket, WebSessionTicket{SessionCredential: binding.SessionCredential, ReturnTo: parsed.String()}, ttl); err != nil {
+		return WebSessionResponse{}, err
+	}
+	return WebSessionResponse{URL: s.issuer + "/oauth/web-session?ticket=" + url.QueryEscape(ticket), ExpiresIn: int(ttl.Seconds())}, nil
+}
+
+func (s *Service) ConsumeWebSessionTicket(ctx context.Context, ticket string) (WebSessionTicket, error) {
+	value, err := s.store.TakeWebTicket(ctx, ticket)
+	if err != nil {
+		return WebSessionTicket{}, ErrInvalidGrant
+	}
+	if _, err := s.sessionByID(ctx, value.SessionCredential); err != nil {
+		return WebSessionTicket{}, ErrInvalidGrant
+	}
+	return value, nil
 }
 
 // Issuer is the token issuer identifier published in metadata and set as the
@@ -155,8 +237,8 @@ type ConsentPrompt struct {
 }
 
 type ScopePrompt struct {
-	Scope       string
-	Description string
+	Scope       string `json:"scope"`
+	Description string `json:"description"`
 }
 
 // Authorize validates an authorization request and either returns a consent
@@ -197,7 +279,7 @@ func (s *Service) Authorize(ctx context.Context, request AuthorizeRequest) (Auth
 		}
 		return AuthorizeOutcome{}, err
 	}
-	if !containsAll(value.Entitlements, s.requiredEntitlements) {
+	if !containsAll(value.Entitlements, s.requiredFor(policy)) {
 		return AuthorizeOutcome{}, ErrMissingScope
 	}
 
@@ -275,6 +357,147 @@ func (s *Service) Consent(ctx context.Context, pendingID string, allow bool, coo
 		return "", err
 	}
 	return redirectWithCode(pending.RedirectURI, code, pending.State), nil
+}
+
+// StartDeviceAuthorization creates the two identifiers defined by RFC 8628.
+// The long device code stays inside the plugin; the short user code is entered
+// or carried in the verification URL shown in the browser.
+func (s *Service) StartDeviceAuthorization(ctx context.Context, clientID, rawScope string) (DeviceAuthorizationResponse, error) {
+	policy, ok := s.registry.Client(clientID)
+	if !ok {
+		return DeviceAuthorizationResponse{}, ErrInvalidClient
+	}
+	scopes := normaliseScope(rawScope)
+	if len(scopes) == 0 || !subsetOf(scopes, policy.Scopes) {
+		return DeviceAuthorizationResponse{}, ErrInvalidGrant
+	}
+	deviceCode, err := randomToken(32)
+	if err != nil {
+		return DeviceAuthorizationResponse{}, err
+	}
+	var userCode string
+	for attempts := 0; attempts < 5; attempts++ {
+		userCode, err = randomUserCode()
+		if err != nil {
+			return DeviceAuthorizationResponse{}, err
+		}
+		err = s.store.PutDevice(ctx, DeviceAuthorization{DeviceCode: hashToken(deviceCode), UserCode: userCode, ClientID: clientID, Scope: scopes, CreatedAt: s.now()}, deviceTTL)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return DeviceAuthorizationResponse{}, err
+	}
+	verification := s.issuer + "/oauth/device"
+	return DeviceAuthorizationResponse{DeviceCode: deviceCode, UserCode: userCode, VerificationURI: verification, VerificationURIComplete: verification + "?user_code=" + url.QueryEscape(userCode), ExpiresIn: int(deviceTTL.Seconds()), Interval: devicePollInterval}, nil
+}
+
+// DevicePrompt validates the code and ensures the approving browser owns a
+// live first-party session. An anonymous browser is redirected through the
+// existing login flow and returns to the same verification page.
+func (s *Service) DevicePrompt(ctx context.Context, userCode, cookie string) (DevicePrompt, error) {
+	userCode = normaliseUserCode(userCode)
+	grant, err := s.store.DeviceByUserCode(ctx, userCode)
+	if err != nil {
+		return DevicePrompt{}, err
+	}
+	if grant.Approved || grant.Denied {
+		return DevicePrompt{}, ErrInvalidGrant
+	}
+	policy, ok := s.registry.Client(grant.ClientID)
+	if !ok {
+		return DevicePrompt{}, ErrInvalidClient
+	}
+	value, _, err := s.activeSession(ctx, cookie)
+	if errors.Is(err, ErrNoSession) {
+		returnTo := "/oauth/device?user_code=" + url.QueryEscape(userCode)
+		separator := "?"
+		if strings.Contains(s.loginURL, "?") {
+			separator = "&"
+		}
+		return DevicePrompt{Redirect: s.loginURL + separator + url.Values{"return_to": {returnTo}}.Encode()}, nil
+	}
+	if err != nil {
+		return DevicePrompt{}, err
+	}
+	if !containsAll(value.Entitlements, s.requiredFor(policy)) {
+		return DevicePrompt{}, ErrMissingScope
+	}
+	return DevicePrompt{UserCode: userCode, ClientName: policy.Name, Scopes: describeScopes(grant.Scope)}, nil
+}
+
+func (s *Service) DecideDevice(ctx context.Context, userCode string, allow bool, cookie string) error {
+	grant, err := s.store.DeviceByUserCode(ctx, normaliseUserCode(userCode))
+	if err != nil {
+		return err
+	}
+	if grant.Approved || grant.Denied {
+		return ErrInvalidGrant
+	}
+	policy, ok := s.registry.Client(grant.ClientID)
+	if !ok {
+		return ErrInvalidClient
+	}
+	value, credential, err := s.activeSession(ctx, cookie)
+	if err != nil {
+		return err
+	}
+	if !containsAll(value.Entitlements, s.requiredFor(policy)) {
+		return ErrMissingScope
+	}
+	grant.Denied = !allow
+	grant.Approved = allow
+	if allow {
+		grant.Subject = value.Subject
+		grant.SessionID = value.AssertionSessionID
+		grant.SessionCredential = credential
+		grant.DisplayName = value.DisplayName
+		grant.OrganizationID = value.OrganizationID
+		grant.Roles = mergeRoles(value.PlatformRoles, value.Roles)
+		grant.Entitlements = value.Entitlements
+	}
+	return s.store.UpdateDevice(ctx, grant)
+}
+
+func (s *Service) requiredFor(policy ClientPolicy) []string {
+	if len(policy.RequiredEntitlements) > 0 {
+		return policy.RequiredEntitlements
+	}
+	return s.requiredEntitlements
+}
+
+func (s *Service) ExchangeDevice(ctx context.Context, deviceCode, clientID string) (TokenResponse, error) {
+	policy, ok := s.registry.Client(clientID)
+	if !ok {
+		return TokenResponse{}, ErrInvalidClient
+	}
+	deviceCodeHash := hashToken(deviceCode)
+	grant, err := s.store.Device(ctx, deviceCodeHash)
+	if errors.Is(err, ErrDeviceNotFound) {
+		return TokenResponse{}, ErrExpiredToken
+	}
+	if err != nil {
+		return TokenResponse{}, err
+	}
+	if grant.ClientID != clientID {
+		return TokenResponse{}, ErrInvalidGrant
+	}
+	if grant.Denied {
+		_, _ = s.store.TakeDevice(ctx, deviceCodeHash)
+		return TokenResponse{}, ErrAccessDenied
+	}
+	if !grant.Approved {
+		return TokenResponse{}, ErrAuthorizationPending
+	}
+	grant, err = s.store.TakeDevice(ctx, deviceCodeHash)
+	if err != nil {
+		return TokenResponse{}, ErrExpiredToken
+	}
+	if _, err := s.sessionByID(ctx, grant.SessionCredential); err != nil {
+		return TokenResponse{}, ErrInvalidGrant
+	}
+	return s.issue(ctx, policy, claimSet{Subject: grant.Subject, SessionID: grant.SessionID, SessionCredential: grant.SessionCredential, DisplayName: grant.DisplayName, OrganizationID: grant.OrganizationID, Roles: grant.Roles, Entitlements: grant.Entitlements, Scope: grant.Scope})
 }
 
 // TokenResponse is the RFC 6749 §5.1 token endpoint payload.
@@ -398,6 +621,11 @@ func (s *Service) issue(ctx context.Context, policy ClientPolicy, claims claimSe
 	if err != nil {
 		return TokenResponse{}, fmt.Errorf("issue access token: %w", err)
 	}
+	if containsString(claims.Scope, ScopeWebSession) {
+		if err := s.store.PutAccessBinding(ctx, hashToken(accessToken), SessionBinding{SessionCredential: claims.SessionCredential, ClientID: policy.ClientID}, policy.AccessTTL); err != nil {
+			return TokenResponse{}, err
+		}
+	}
 	response := TokenResponse{
 		AccessToken: accessToken,
 		TokenType:   "Bearer",
@@ -503,7 +731,11 @@ func (s *Service) loginRedirect(request AuthorizeRequest) string {
 func describeScopes(scopes []string) []ScopePrompt {
 	result := make([]ScopePrompt, 0, len(scopes))
 	for _, scope := range scopes {
-		result = append(result, ScopePrompt{Scope: scope, Description: ScopeDescriptions[scope]})
+		description := ScopeDescriptions[scope]
+		if description == "" {
+			description = scope
+		}
+		result = append(result, ScopePrompt{Scope: scope, Description: description})
 	}
 	return result
 }
@@ -551,6 +783,27 @@ func randomToken(size int) (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(buffer), nil
+}
+
+func randomUserCode() (string, error) {
+	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+	buffer := make([]byte, 8)
+	if _, err := rand.Read(buffer); err != nil {
+		return "", err
+	}
+	for index := range buffer {
+		buffer[index] = alphabet[int(buffer[index])%len(alphabet)]
+	}
+	return string(buffer[:4]) + "-" + string(buffer[4:]), nil
+}
+
+func normaliseUserCode(value string) string {
+	value = strings.ToUpper(strings.TrimSpace(value))
+	value = strings.ReplaceAll(value, " ", "")
+	if len(value) == 8 {
+		return value[:4] + "-" + value[4:]
+	}
+	return value
 }
 
 func cookieValue(raw, name string) (string, int) {

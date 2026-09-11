@@ -39,10 +39,11 @@ func TestMain(m *testing.M) {
 
 // harness wires a service against in-memory stores and a controllable clock.
 type harness struct {
-	service  *Service
-	sessions *session.MemoryStore
-	mu       sync.Mutex
-	now      time.Time
+	service    *Service
+	sessions   *session.MemoryStore
+	oauthStore *MemoryStore
+	mu         sync.Mutex
+	now        time.Time
 }
 
 func newHarness(t *testing.T) *harness {
@@ -52,33 +53,36 @@ func newHarness(t *testing.T) *harness {
 			ClientID:     testClientID,
 			Name:         "知序资产中心 for Obsidian",
 			RedirectURIs: []string{"http://127.0.0.1/callback", "http://[::1]/callback"},
-			Scopes:       []string{ScopeDocumentsRead, ScopeDocumentsWrite, ScopeOfflineAccess},
+			Scopes:       []string{ScopeDocumentsRead, ScopeDocumentsWrite, ScopeWebSession, ScopeOfflineAccess},
 			Audience:     "asset-hub-api",
 			AccessTTL:    15 * time.Minute,
 			RefreshTTL:   30 * 24 * time.Hour,
 		},
 		{
-			ClientID:     "other-client",
-			Name:         "另一个客户端",
-			RedirectURIs: []string{"http://127.0.0.1/callback"},
-			Scopes:       []string{ScopeDocumentsRead},
-			Audience:     "other-api",
-			AccessTTL:    5 * time.Minute,
-			RefreshTTL:   time.Hour,
+			ClientID:             "other-client",
+			Name:                 "另一个客户端",
+			RedirectURIs:         []string{"http://127.0.0.1/callback"},
+			Scopes:               []string{ScopeDocumentsRead},
+			Audience:             "other-api",
+			AccessTTL:            5 * time.Minute,
+			RefreshTTL:           time.Hour,
+			RequiredEntitlements: []string{"other:access"},
 		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	sessions := session.NewMemoryStore()
+	oauthStore := NewMemoryStore()
 	service, err := NewService(ServiceOptions{
 		Registry:             registry,
-		Store:                NewMemoryStore(),
+		Store:                oauthStore,
 		Sessions:             sessions,
 		Signer:               testSigner,
 		Issuer:               "https://shiguanglab.com",
 		CookieName:           testCookieName,
 		LoginURL:             "https://shiguanglab.com/login",
+		WebAppURL:            "https://doc.shiguanglab.com",
 		IdleTTL:              12 * time.Hour,
 		AbsoluteTTL:          7 * 24 * time.Hour,
 		CodeTTL:              time.Minute,
@@ -88,9 +92,80 @@ func newHarness(t *testing.T) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := &harness{service: service, sessions: sessions, now: time.Now()}
+	h := &harness{service: service, sessions: sessions, oauthStore: oauthStore, now: time.Now()}
 	service.now = h.clock
 	return h
+}
+
+func TestDeviceAuthorizationAndWebSessionTicket(t *testing.T) {
+	h := newHarness(t)
+	h.seedSession(t, "sess-1", testSubject, []string{testEntitle})
+	ctx := context.Background()
+	started, err := h.service.StartDeviceAuthorization(ctx, testClientID, "documents:read web:session offline_access")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started.DeviceCode == "" || started.UserCode == "" || !strings.HasPrefix(started.VerificationURIComplete, "https://shiguanglab.com/oauth/device?") {
+		t.Fatalf("unexpected response: %#v", started)
+	}
+	if _, err := h.oauthStore.Device(ctx, started.DeviceCode); !errors.Is(err, ErrDeviceNotFound) {
+		t.Fatal("the bearer device code must not be stored in plaintext")
+	}
+	if _, err := h.oauthStore.Device(ctx, hashToken(started.DeviceCode)); err != nil {
+		t.Fatalf("hashed device grant is missing: %v", err)
+	}
+	if _, err := h.service.ExchangeDevice(ctx, started.DeviceCode, testClientID); !errors.Is(err, ErrAuthorizationPending) {
+		t.Fatalf("pending exchange: %v", err)
+	}
+	prompt, err := h.service.DevicePrompt(ctx, started.UserCode, cookieFor("sess-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prompt.ClientName == "" {
+		t.Fatal("missing device prompt")
+	}
+	if err := h.service.DecideDevice(ctx, started.UserCode, true, cookieFor("sess-1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.service.DecideDevice(ctx, started.UserCode, false, cookieFor("sess-1")); !errors.Is(err, ErrInvalidGrant) {
+		t.Fatalf("a device decision must be final: %v", err)
+	}
+	tokens, err := h.service.ExchangeDevice(ctx, started.DeviceCode, testClientID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	web, err := h.service.CreateWebSessionTicket(ctx, tokens.AccessToken, "https://doc.shiguanglab.com/assets/ast_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, _ := url.Parse(web.URL)
+	ticket := parsed.Query().Get("ticket")
+	consumed, err := h.service.ConsumeWebSessionTicket(ctx, ticket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if consumed.SessionCredential != "sess-1" || consumed.ReturnTo != "https://doc.shiguanglab.com/assets/ast_1" {
+		t.Fatalf("unexpected ticket: %#v", consumed)
+	}
+	if _, err := h.service.ConsumeWebSessionTicket(ctx, ticket); !errors.Is(err, ErrInvalidGrant) {
+		t.Fatalf("ticket must be single-use: %v", err)
+	}
+}
+
+func TestDeviceAuthorizationUsesClientEntitlements(t *testing.T) {
+	h := newHarness(t)
+	h.seedSession(t, "asset-session", testSubject, []string{testEntitle})
+	h.seedSession(t, "other-session", testSubject, []string{"other:access"})
+	started, err := h.service.StartDeviceAuthorization(context.Background(), "other-client", ScopeDocumentsRead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.DevicePrompt(context.Background(), started.UserCode, cookieFor("asset-session")); !errors.Is(err, ErrMissingScope) {
+		t.Fatalf("asset entitlement must not approve another client: %v", err)
+	}
+	if _, err := h.service.DevicePrompt(context.Background(), started.UserCode, cookieFor("other-session")); err != nil {
+		t.Fatalf("client entitlement should approve its own client: %v", err)
+	}
 }
 
 func (h *harness) clock() time.Time {

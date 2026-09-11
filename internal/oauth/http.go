@@ -5,7 +5,9 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 )
 
 // Handler exposes the authorization server endpoints. They are mounted outside
@@ -31,14 +33,150 @@ func (h *Handler) Metadata(response http.ResponseWriter, _ *http.Request) {
 		"issuer":                                issuer,
 		"authorization_endpoint":                issuer + "/oauth/authorize",
 		"token_endpoint":                        issuer + "/oauth/token",
+		"device_authorization_endpoint":         issuer + "/oauth/device/authorize",
 		"revocation_endpoint":                   issuer + "/oauth/revoke",
 		"jwks_uri":                              issuer + "/.well-known/jwks.json",
 		"scopes_supported":                      h.service.Registry().ScopesSupported(),
 		"response_types_supported":              []string{"code"},
-		"grant_types_supported":                 []string{"authorization_code", "refresh_token"},
+		"grant_types_supported":                 []string{"authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"},
 		"code_challenge_methods_supported":      []string{"S256"},
 		"token_endpoint_auth_methods_supported": []string{"none"},
 	})
+}
+
+// DeviceAuthorize starts an RFC 8628 authorization request.
+func (h *Handler) DeviceAuthorize(response http.ResponseWriter, request *http.Request) {
+	setNoStore(response)
+	if err := request.ParseForm(); err != nil {
+		writeOAuthError(response, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	result, err := h.service.StartDeviceAuthorization(request.Context(), request.PostForm.Get("client_id"), request.PostForm.Get("scope"))
+	if err != nil {
+		h.respondTokenFailure(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, result)
+}
+
+func (h *Handler) DeviceVerification(response http.ResponseWriter, request *http.Request) {
+	prompt, err := h.service.DevicePrompt(request.Context(), request.URL.Query().Get("user_code"), request.Header.Get("Cookie"))
+	if err != nil {
+		h.renderError(response, http.StatusBadRequest, "设备验证码无效或已过期，请返回发起连接的应用重新登录。")
+		return
+	}
+	if prompt.Redirect != "" {
+		http.Redirect(response, request, prompt.Redirect, http.StatusFound)
+		return
+	}
+	h.renderDevice(response, prompt, "")
+}
+
+func (h *Handler) DeviceVerificationSubmit(response http.ResponseWriter, request *http.Request) {
+	if request.Header.Get("Origin") != h.service.Issuer() {
+		h.renderError(response, http.StatusForbidden, "请求来源无效。")
+		return
+	}
+	if err := request.ParseForm(); err != nil {
+		h.renderError(response, http.StatusBadRequest, "请求格式不正确。")
+		return
+	}
+	code := request.PostForm.Get("user_code")
+	err := h.service.DecideDevice(request.Context(), code, request.PostForm.Get("decision") == "allow", request.Header.Get("Cookie"))
+	if errors.Is(err, ErrNoSession) {
+		location := h.service.loginURL + "?" + url.Values{"return_to": {"/oauth/device?user_code=" + url.QueryEscape(code)}}.Encode()
+		http.Redirect(response, request, location, http.StatusFound)
+		return
+	}
+	if err != nil {
+		h.renderError(response, http.StatusBadRequest, "设备授权已失效，请返回发起连接的应用重新登录。")
+		return
+	}
+	h.renderDevice(response, DevicePrompt{}, "授权处理完成，可以关闭此页面并返回发起连接的应用。")
+}
+
+// DeviceContext is the JSON contract consumed by the public Website page.
+// Keeping the page outside auth-service lets every first-party app share the
+// same branded UI while client validation and session binding stay here.
+func (h *Handler) DeviceContext(response http.ResponseWriter, request *http.Request) {
+	setNoStore(response)
+	prompt, err := h.service.DevicePrompt(request.Context(), request.URL.Query().Get("user_code"), request.Header.Get("Cookie"))
+	if err != nil {
+		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid_or_expired_user_code"})
+		return
+	}
+	if prompt.Redirect != "" {
+		writeJSON(response, http.StatusUnauthorized, map[string]string{"error": "login_required", "login_url": prompt.Redirect})
+		return
+	}
+	writeJSON(response, http.StatusOK, map[string]any{
+		"user_code":   prompt.UserCode,
+		"client_name": prompt.ClientName,
+		"scopes":      prompt.Scopes,
+	})
+}
+
+func (h *Handler) DeviceDecision(response http.ResponseWriter, request *http.Request) {
+	setNoStore(response)
+	if request.Header.Get("Origin") != h.service.Issuer() {
+		writeJSON(response, http.StatusForbidden, map[string]string{"error": "invalid_origin"})
+		return
+	}
+	if err := request.ParseForm(); err != nil {
+		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	decision := request.PostForm.Get("decision")
+	if decision != "allow" && decision != "deny" {
+		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid_decision"})
+		return
+	}
+	err := h.service.DecideDevice(request.Context(), request.PostForm.Get("user_code"), decision == "allow", request.Header.Get("Cookie"))
+	if errors.Is(err, ErrNoSession) {
+		writeJSON(response, http.StatusUnauthorized, map[string]string{"error": "login_required"})
+		return
+	}
+	if err != nil {
+		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid_or_expired_user_code"})
+		return
+	}
+	status := "denied"
+	if decision == "allow" {
+		status = "approved"
+	}
+	writeJSON(response, http.StatusOK, map[string]string{"status": status})
+}
+
+func (h *Handler) WebSessionTicket(response http.ResponseWriter, request *http.Request) {
+	setNoStore(response)
+	authorization := request.Header.Get("Authorization")
+	scheme, token, ok := strings.Cut(authorization, " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") || strings.TrimSpace(token) == "" {
+		writeOAuthError(response, http.StatusUnauthorized, "invalid_token")
+		return
+	}
+	if err := request.ParseForm(); err != nil {
+		writeOAuthError(response, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	result, err := h.service.CreateWebSessionTicket(request.Context(), strings.TrimSpace(token), request.PostForm.Get("return_to"))
+	if err != nil {
+		writeOAuthError(response, http.StatusUnauthorized, "invalid_token")
+		return
+	}
+	writeJSON(response, http.StatusOK, result)
+}
+
+func (h *Handler) WebSession(response http.ResponseWriter, request *http.Request) {
+	setNoStore(response)
+	response.Header().Set("Referrer-Policy", "no-referrer")
+	result, err := h.service.ConsumeWebSessionTicket(request.Context(), request.URL.Query().Get("ticket"))
+	if err != nil {
+		h.renderError(response, http.StatusBadRequest, "登录链接无效或已过期，请返回 Obsidian 重试。")
+		return
+	}
+	http.SetCookie(response, &http.Cookie{Name: h.service.cookieName, Value: result.SessionCredential, Path: "/", Domain: h.service.cookieDomain, MaxAge: int(h.service.absoluteTTL.Seconds()), Secure: strings.HasPrefix(h.service.issuer, "https://"), HttpOnly: true, SameSite: http.SameSiteLaxMode})
+	http.Redirect(response, request, result.ReturnTo, http.StatusFound)
 }
 
 // Authorize handles GET /oauth/authorize.
@@ -119,6 +257,22 @@ func (h *Handler) Token(response http.ResponseWriter, request *http.Request) {
 		)
 		if err != nil {
 			h.respondTokenFailure(response, err)
+			return
+		}
+		writeTokenResponse(response, tokens)
+	case "urn:ietf:params:oauth:grant-type:device_code":
+		tokens, err := h.service.ExchangeDevice(request.Context(), request.PostForm.Get("device_code"), request.PostForm.Get("client_id"))
+		if err != nil {
+			switch {
+			case errors.Is(err, ErrAuthorizationPending):
+				writeOAuthError(response, http.StatusBadRequest, "authorization_pending")
+			case errors.Is(err, ErrAccessDenied):
+				writeOAuthError(response, http.StatusBadRequest, "access_denied")
+			case errors.Is(err, ErrExpiredToken):
+				writeOAuthError(response, http.StatusBadRequest, "expired_token")
+			default:
+				h.respondTokenFailure(response, err)
+			}
 			return
 		}
 		writeTokenResponse(response, tokens)

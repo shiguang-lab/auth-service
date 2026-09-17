@@ -21,10 +21,7 @@ services:
       - auth-backend
 
   auth-service:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    image: shiguang/auth-service:local
+    image: ghcr.io/shiguang-lab/auth-service:${AUTH_SERVICE_IMAGE_TAG:-latest}
     restart: unless-stopped
     user: "1000:10"
     env_file:

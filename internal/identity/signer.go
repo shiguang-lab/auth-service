@@ -123,6 +123,71 @@ func (s *Signer) Issue(subject Subject, now time.Time) (string, error) {
 	return string(signed), nil
 }
 
+// AccessToken describes an RFC 9068 access token minted for a registered OAuth
+// client. It is intentionally a distinct type from Subject: access tokens must
+// never be interchangeable with the gateway identity assertion, which is why
+// they are signed with a different JWS type header ("at+jwt").
+type AccessToken struct {
+	Audience       string
+	Subject        string
+	SessionID      string
+	ClientID       string
+	Scope          string
+	DisplayName    string
+	OrganizationID string
+	Roles          []string
+	Entitlements   []string
+	TTL            time.Duration
+}
+
+// IssueAccessToken signs an OAuth 2.0 access token. A non-positive TTL falls
+// back to the signer's configured identity token TTL.
+func (s *Signer) IssueAccessToken(access AccessToken, now time.Time) (string, error) {
+	jti, err := randomID()
+	if err != nil {
+		return "", err
+	}
+	ttl := access.TTL
+	if ttl <= 0 {
+		ttl = s.ttl
+	}
+	token := jwt.New()
+	claims := map[string]any{
+		jwt.IssuerKey:     s.issuer,
+		jwt.AudienceKey:   access.Audience,
+		jwt.SubjectKey:    access.Subject,
+		"sid":             access.SessionID,
+		"client_id":       access.ClientID,
+		"scope":           access.Scope,
+		"name":            access.DisplayName,
+		"org_id":          access.OrganizationID,
+		"roles":           access.Roles,
+		"entitlements":    access.Entitlements,
+		jwt.JwtIDKey:      jti,
+		jwt.IssuedAtKey:   now,
+		jwt.NotBeforeKey:  now.Add(-5 * time.Second),
+		jwt.ExpirationKey: now.Add(ttl),
+	}
+	for name, value := range claims {
+		if err := token.Set(name, value); err != nil {
+			return "", fmt.Errorf("set access token claim %q: %w", name, err)
+		}
+	}
+
+	headers := jws.NewHeaders()
+	if err := headers.Set(jws.TypeKey, "at+jwt"); err != nil {
+		return "", fmt.Errorf("set access token type: %w", err)
+	}
+	signed, err := jwt.Sign(
+		token,
+		jwt.WithKey(jwa.RS256(), s.privateKey, jws.WithProtectedHeaders(headers)),
+	)
+	if err != nil {
+		return "", fmt.Errorf("sign access token: %w", err)
+	}
+	return string(signed), nil
+}
+
 func (s *Signer) JWKS() jwk.Set {
 	return s.publicKeys
 }

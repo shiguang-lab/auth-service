@@ -5,8 +5,8 @@ Add both to `ALLOWED_RETURN_ORIGINS` and grant `plasmic:access` through IAM poli
 The gateway authorizes the product with audience `plasmic-api`; Studio validates
 RS256 `sg-identity+jwt` assertions and references users by `sub` in business tables.
 
-Register the `plasmic-desktop` public native client with redirect URI
-`http://127.0.0.1/callback`, scope `web:session`, audience `plasmic-desktop`, webAppUrl
+Register the `plasmicapp` public native client with redirect URI
+`http://127.0.0.1/callback`, scope `web:session`, audience `plasmicapp`, webAppUrl
 `https://studio.plasmic.shiguanglab.com/`, and required entitlement `plasmic:access`.
 Add the registration to `OAUTH_CLIENTS_JSON` without removing existing clients.
 The native authorization-code flow uses PKCE S256 and consumes an IAM web-session

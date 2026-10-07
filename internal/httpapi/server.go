@@ -239,6 +239,8 @@ func (s *Server) Handler() http.Handler {
 		router.Group(func(identityAPI chi.Router) {
 			identityAPI.Use(s.orgs.RequireIdentityAPIToken)
 			identityAPI.Post("/v1/identity/users/batch-get", s.orgs.BatchGetUsersHandler)
+			identityAPI.Post("/v1/identity/users/by-email", s.orgs.UserByEmailHandler)
+			identityAPI.Post("/v1/identity/users/query", s.orgs.SearchUsersHandler)
 			identityAPI.Get("/v1/identity/orgs/{orgID}/members", s.orgs.ServiceListMembersHandler)
 		})
 	}

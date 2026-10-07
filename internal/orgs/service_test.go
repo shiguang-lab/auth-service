@@ -216,6 +216,8 @@ func routerFor(service *Service) http.Handler {
 	router.Group(func(identityAPI chi.Router) {
 		identityAPI.Use(service.RequireIdentityAPIToken)
 		identityAPI.Post("/v1/identity/users/batch-get", service.BatchGetUsersHandler)
+		identityAPI.Post("/v1/identity/users/by-email", service.UserByEmailHandler)
+		identityAPI.Post("/v1/identity/users/query", service.SearchUsersHandler)
 		identityAPI.Get("/v1/identity/orgs/{orgID}/members", service.ServiceListMembersHandler)
 	})
 	router.Group(func(pointsIdentity chi.Router) {
@@ -522,4 +524,61 @@ func TestMutationsRejectForeignOrigin(t *testing.T) {
 
 func itoa(value int) string {
 	return strconv.Itoa(value)
+}
+
+func (f *fakeDirectory) GetUserByEmail(_ context.Context, email string) (zitadel.User, error) {
+	if f.searchErr != nil {
+		return zitadel.User{}, f.searchErr
+	}
+	for _, user := range f.users {
+		if strings.EqualFold(user.Email, email) {
+			return user, nil
+		}
+	}
+	return zitadel.User{}, &zitadel.APIError{StatusCode: http.StatusNotFound}
+}
+
+func TestIdentityEmailResolutionRequiresVerifiedActiveUserAndServiceToken(t *testing.T) {
+	service, directory, _ := newTestService(t)
+	directory.users["u1"] = zitadel.User{ID: "u1", Email: "user@example.com", EmailVerified: true, State: "USER_STATE_ACTIVE"}
+	handler := routerFor(service)
+	for _, tc := range []struct {
+		name, email, token, state string
+		verified                  bool
+		status                    int
+		found                     bool
+	}{
+		{"valid", "USER@example.com", strings.Repeat("i", 40), "USER_STATE_ACTIVE", true, 200, true},
+		{"unverified", "user@example.com", strings.Repeat("i", 40), "USER_STATE_ACTIVE", false, 200, false},
+		{"inactive", "user@example.com", strings.Repeat("i", 40), "USER_STATE_INACTIVE", true, 200, false},
+		{"missing", "other@example.com", strings.Repeat("i", 40), "USER_STATE_ACTIVE", true, 200, false},
+		{"malformed", "not an email", strings.Repeat("i", 40), "USER_STATE_ACTIVE", true, 400, false},
+		{"no token", "user@example.com", "", "USER_STATE_ACTIVE", true, 401, false},
+		{"points token rejected", "user@example.com", strings.Repeat("p", 40), "USER_STATE_ACTIVE", true, 401, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user := directory.users["u1"]
+			user.State = tc.state
+			user.EmailVerified = tc.verified
+			directory.users["u1"] = user
+			body, _ := json.Marshal(map[string]string{"email": tc.email})
+			res := doJSON(t, handler, "POST", "/v1/identity/users/by-email", "", string(body), map[string]string{"Authorization": "Bearer " + tc.token})
+			if res.Code != tc.status {
+				t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+			}
+			if tc.status == 200 {
+				var result struct {
+					User *struct {
+						ID string `json:"id"`
+					} `json:"user"`
+				}
+				if err := json.Unmarshal(res.Body.Bytes(), &result); err != nil {
+					t.Fatal(err)
+				}
+				if (result.User != nil) != tc.found {
+					t.Fatalf("unexpected subject %s", res.Body.String())
+				}
+			}
+		})
+	}
 }

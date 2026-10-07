@@ -86,6 +86,12 @@ func (s *Signer) Issue(subject Subject, now time.Time) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if subject.Roles == nil {
+		subject.Roles = []string{}
+	}
+	if subject.Entitlements == nil {
+		subject.Entitlements = []string{}
+	}
 	token := jwt.New()
 	claims := map[string]any{
 		jwt.IssuerKey:     s.issuer,

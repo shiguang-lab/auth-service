@@ -17,6 +17,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/mail"
 	"regexp"
 	"strings"
 	"sync"
@@ -51,6 +52,7 @@ type directoryClient interface {
 	DeleteAuthorization(context.Context, string) error
 	ListAuthorizations(context.Context, zitadel.AuthorizationFilter) ([]zitadel.Authorization, error)
 	GetUserByLoginName(context.Context, string) (zitadel.User, error)
+	GetUserByEmail(context.Context, string) (zitadel.User, error)
 	SearchUsersByIDs(context.Context, []string) ([]zitadel.User, error)
 	SearchUsers(context.Context, string, int) ([]zitadel.User, error)
 }
@@ -513,6 +515,40 @@ func (s *Service) allowUserSearch() bool {
 	return true
 }
 
+// UserByEmailHandler resolves a verified primary email into an ACTIVE IAM subject.
+// Products use this service-only endpoint for invitations, never for signing in.
+func (s *Service) UserByEmailHandler(response http.ResponseWriter, request *http.Request) {
+	var input struct {
+		Email string `json:"email"`
+	}
+	if err := decodeJSON(request, &input); err != nil {
+		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	address, err := mail.ParseAddress(strings.TrimSpace(input.Email))
+	if err != nil || address.Address != strings.TrimSpace(input.Email) || len(input.Email) > 254 {
+		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(request.Context(), 2*time.Second)
+	defer cancel()
+	user, err := s.zitadel.GetUserByEmail(ctx, address.Address)
+	if err != nil {
+		var apiErr *zitadel.APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			writeJSON(response, http.StatusOK, map[string]any{"user": nil})
+			return
+		}
+		s.serverError(response, err)
+		return
+	}
+	if !activeUserState(user.State) || !user.EmailVerified || !strings.EqualFold(user.Email, address.Address) {
+		writeJSON(response, http.StatusOK, map[string]any{"user": nil})
+		return
+	}
+	writeJSON(response, http.StatusOK, map[string]any{"user": map[string]string{"id": user.ID}})
+}
+
 func (s *Service) BatchGetUsersHandler(response http.ResponseWriter, request *http.Request) {
 	var input struct {
 		IDs []string `json:"ids"`
@@ -529,11 +565,12 @@ func (s *Service) BatchGetUsersHandler(response http.ResponseWriter, request *ht
 	result := make([]map[string]any, 0, len(users))
 	for _, user := range users {
 		result = append(result, map[string]any{
-			"id":          user.ID,
-			"loginName":   user.LoginName,
-			"displayName": user.DisplayName,
-			"email":       user.Email,
-			"state":       user.State,
+			"id":            user.ID,
+			"loginName":     user.LoginName,
+			"displayName":   user.DisplayName,
+			"email":         user.Email,
+			"emailVerified": user.EmailVerified,
+			"state":         user.State,
 		})
 	}
 	writeJSON(response, http.StatusOK, map[string]any{"users": result})

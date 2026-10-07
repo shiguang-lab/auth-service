@@ -172,7 +172,7 @@ func (h *Handler) WebSession(response http.ResponseWriter, request *http.Request
 	response.Header().Set("Referrer-Policy", "no-referrer")
 	result, err := h.service.ConsumeWebSessionTicket(request.Context(), request.URL.Query().Get("ticket"))
 	if err != nil {
-		h.renderError(response, http.StatusBadRequest, "登录链接无效或已过期，请返回 Obsidian 重试。")
+		h.renderError(response, http.StatusBadRequest, "登录链接无效或已过期，请返回应用重试。")
 		return
 	}
 	http.SetCookie(response, &http.Cookie{Name: h.service.cookieName, Value: result.SessionCredential, Path: "/", Domain: h.service.cookieDomain, MaxAge: int(h.service.absoluteTTL.Seconds()), Secure: strings.HasPrefix(h.service.issuer, "https://"), HttpOnly: true, SameSite: http.SameSiteLaxMode})

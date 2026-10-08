@@ -236,10 +236,7 @@ type AuthorizeOutcome struct {
 
 // ConsentPrompt is the data rendered into the consent form.
 type ConsentPrompt struct {
-	DisplayName string
-	PendingID   string
-	ClientName  string
-	Scopes      []ScopePrompt
+	PendingID string
 }
 
 type ScopePrompt struct {
@@ -310,10 +307,7 @@ func (s *Service) Authorize(ctx context.Context, request AuthorizeRequest) (Auth
 		return AuthorizeOutcome{}, err
 	}
 	return AuthorizeOutcome{Consent: &ConsentPrompt{
-		DisplayName: value.DisplayName,
-		PendingID:   pendingID,
-		ClientName:  policy.Name,
-		Scopes:      describeScopes(scopes),
+		PendingID: pendingID,
 	}}, nil
 }
 

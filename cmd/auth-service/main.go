@@ -196,7 +196,8 @@ func main() {
 				ClientID: client.ClientID, Name: client.Name, RedirectURIs: client.RedirectURIs,
 				Scopes: client.Scopes, Audience: client.Audience, WebAppURL: client.WebAppURL,
 				RequiredEntitlements: client.RequiredEntitlements,
-				AccessTTL:            cfg.OAuthAccessTokenTTL, RefreshTTL: cfg.OAuthRefreshTokenTTL,
+				LogoURL:              client.LogoURL, AppCallbackURL: client.AppCallbackURL,
+				AccessTTL: cfg.OAuthAccessTokenTTL, RefreshTTL: cfg.OAuthRefreshTokenTTL,
 			})
 		}
 		registry, err := oauthservice.NewRegistry(clientPolicies)

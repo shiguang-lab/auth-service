@@ -677,3 +677,37 @@ func (h *harness) issueTokens(t *testing.T) TokenResponse {
 	}
 	return tokens
 }
+
+func TestPublicAppAuthorizationCodeStillRequiresTheOriginalPKCEVerifier(t *testing.T) {
+	h := newHarness(t)
+	policy := testPolicy(t, "https://shiguanglab.com/auth/apps/obsidian-asset-hub/callback")
+	policy.AppCallbackURL = "notes-desktop://oauth/callback"
+	policy.LogoURL = "/assets/notes.png"
+	registry, err := NewRegistry([]ClientPolicy{policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.service.registry = registry
+	h.seedSession(t, "sess-1", testSubject, []string{testEntitle})
+	verifier, challenge := pkcePair(t)
+	request := defaultAuthorizeRequest(challenge)
+	request.RedirectURI = policy.RedirectURIs[0]
+	location := h.authorizeAndConsent(t, request, true)
+	parsed, err := url.Parse(location)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Scheme != "https" || parsed.Path != "/auth/apps/obsidian-asset-hub/callback" {
+		t.Fatal("expected registered public callback")
+	}
+	code := parsed.Query().Get("code")
+	if _, err := h.service.ExchangeCode(context.Background(), code, testClientID, request.RedirectURI, strings.Repeat("x", 43)); !errors.Is(err, ErrInvalidGrant) {
+		t.Fatal("public callback code must be PKCE-bound")
+	}
+	// A failed verifier consumes the code. Request a fresh code for the legitimate exchange.
+	location = h.authorizeAndConsent(t, request, true)
+	code = queryParam(t, location, "code")
+	if _, err := h.service.ExchangeCode(context.Background(), code, testClientID, request.RedirectURI, verifier); err != nil {
+		t.Fatal(err)
+	}
+}

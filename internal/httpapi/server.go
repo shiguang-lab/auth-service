@@ -137,6 +137,8 @@ func (s *Server) Handler() http.Handler {
 	// validation and the user's own session cookie.
 	if s.oauth != nil {
 		router.Get("/.well-known/oauth-authorization-server", s.oauth.Metadata)
+		router.Get("/oauth/app", s.oauth.AppMetadata)
+		router.Get("/oauth/app/context", s.oauth.AppContext)
 		router.Get("/oauth/authorize", s.oauth.Authorize)
 		router.Post("/oauth/authorize", s.oauth.ConsentSubmit)
 		router.Post("/oauth/device/authorize", s.oauth.DeviceAuthorize)

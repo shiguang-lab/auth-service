@@ -99,6 +99,9 @@ production startup keeps the IAM writer nil and fail-closed.
 | `GET` | `/health/ready` | Public |
 | `GET` | `/.well-known/jwks.json` | Public |
 | `GET` | `/.well-known/oauth-authorization-server` | Public OAuth metadata |
+| `GET`, `POST` | `/oauth/authorize` | Website session; PKCE consent |
+| `GET` | `/oauth/app` | Public registered App branding and native callback metadata |
+| `GET` | `/oauth/app/context` | Website session bound to the pending authorization request |
 | `POST` | `/oauth/device/authorize` | Public OAuth device request |
 | `GET`, `POST` | `/oauth/device` | Website session; device confirmation |
 | `POST` | `/oauth/token` | OAuth grant credential |
@@ -138,6 +141,18 @@ to register several native applications; the device confirmation page reads the
 registered client name and scopes dynamically and contains no app-specific flow.
 Each client owns its scopes, API audience, optional web-session target and
 required entitlements. Device-only clients do not need a redirect URI.
+Native clients using the public Website flow register an exact HTTPS
+`redirectUris` entry at `/auth/apps/<clientId>/callback`, a `logoUrl` asset
+under `/assets/`, and an `appCallbackUrl` such as
+`plasmic-desktop://oauth/callback`. Website owns both the consent and callback
+pages and reads each App's metadata from this registry. Authorization creates a
+single-use, session-bound pending request; consent submits to Auth Service.
+The public callback automatically requests opening the registered App with only
+the authorization code and state. The App verifies state and exchanges the code
+with its in-memory PKCE verifier. Tokens and session tickets stay outside the
+browser callback page. HTTP loopback registrations remain available for clients
+that use local listeners.
+
 Browser sessions retain the entitlement snapshot from sign-in. If an OAuth
 authorization requires an entitlement absent from that snapshot but granted by
 the current `DEFAULT_ENTITLEMENTS`, the browser returns to login and resumes the

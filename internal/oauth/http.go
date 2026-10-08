@@ -200,7 +200,8 @@ func (h *Handler) Authorize(response http.ResponseWriter, request *http.Request)
 		http.Redirect(response, request, outcome.Redirect, http.StatusFound)
 		return
 	}
-	h.renderConsent(response, outcome.Consent)
+	location := h.service.Issuer() + "/auth/apps/" + url.PathEscape(query.Get("client_id")) + "/authorize?" + url.Values{"request": {outcome.Consent.PendingID}}.Encode()
+	http.Redirect(response, request, location, http.StatusFound)
 }
 
 // ConsentSubmit handles POST /oauth/authorize, the consent form submission.
@@ -355,4 +356,45 @@ func writeJSON(response http.ResponseWriter, status int, payload any) {
 	response.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	response.WriteHeader(status)
 	_, _ = response.Write(body)
+}
+
+// AppMetadata exposes only registered presentation and native callback settings.
+func (h *Handler) AppMetadata(response http.ResponseWriter, request *http.Request) {
+	setNoStore(response)
+	client, ok := h.service.Registry().Client(request.URL.Query().Get("client_id"))
+	if !ok {
+		writeJSON(response, http.StatusNotFound, map[string]string{"error": "unknown_client"})
+		return
+	}
+	writeJSON(response, http.StatusOK, appMetadata(client))
+}
+func appMetadata(client ClientPolicy) map[string]string {
+	return map[string]string{"client_id": client.ClientID, "name": client.Name, "logo_url": client.LogoURL, "app_callback_url": client.AppCallbackURL}
+}
+
+// AppContext binds Website's authorization UI to the existing single-use request.
+func (h *Handler) AppContext(response http.ResponseWriter, request *http.Request) {
+	setNoStore(response)
+	id := request.URL.Query().Get("request")
+	pending, err := h.service.store.Pending(request.Context(), id)
+	if err != nil {
+		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid_or_expired_request"})
+		return
+	}
+	client, ok := h.service.Registry().Client(pending.ClientID)
+	if !ok {
+		writeJSON(response, http.StatusBadRequest, map[string]string{"error": "unknown_client"})
+		return
+	}
+	value, credential, err := h.service.activeSession(request.Context(), request.Header.Get("Cookie"))
+	if errors.Is(err, ErrNoSession) {
+		target := "/auth/apps/" + url.PathEscape(client.ClientID) + "/authorize?" + url.Values{"request": {id}}.Encode()
+		writeJSON(response, http.StatusUnauthorized, map[string]string{"error": "login_required", "login_url": h.service.loginURL + "?" + url.Values{"return_to": {target}}.Encode()})
+		return
+	}
+	if err != nil || value.Subject != pending.Subject || credential != pending.SessionCredential {
+		writeJSON(response, http.StatusForbidden, map[string]string{"error": "session_changed"})
+		return
+	}
+	writeJSON(response, http.StatusOK, map[string]any{"app": appMetadata(client), "display_name": value.DisplayName, "scopes": describeScopes(pending.Scope)})
 }

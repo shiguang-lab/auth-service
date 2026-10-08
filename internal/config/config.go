@@ -31,6 +31,8 @@ type OAuthClientPolicy struct {
 	Scopes               []string `json:"scopes"`
 	Audience             string   `json:"audience"`
 	WebAppURL            string   `json:"webAppUrl"`
+	LogoURL              string   `json:"logoUrl"`
+	AppCallbackURL       string   `json:"appCallbackUrl"`
 	RequiredEntitlements []string `json:"requiredEntitlements"`
 }
 

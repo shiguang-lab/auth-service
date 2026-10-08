@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -25,12 +26,9 @@ const redirectPath = "/callback"
 
 // ClientPolicy is one statically registered first-party OAuth client.
 //
-// RedirectURIs are templates rather than literals. Each pins scheme, host and
-// path but may leave the port out, in which case any port is accepted. RFC 8252
-// §7.3 requires this for native clients, which cannot know in advance which
-// port they will bind. A port may be pinned by including it, e.g.
-// "http://127.0.0.1:27123/callback". Registering both the IPv4 and IPv6 loopback
-// templates is the usual configuration.
+// HTTPS redirects pin scheme, host, port and the registered client's public
+// Website callback path. HTTP loopback templates may omit a port so native
+// clients can bind an ephemeral listener as required by RFC 8252 §7.3.
 type ClientPolicy struct {
 	ClientID     string
 	Name         string
@@ -43,13 +41,15 @@ type ClientPolicy struct {
 	// RequiredEntitlements must all be present before this client can be approved.
 	RequiredEntitlements []string
 	// WebAppURL is the only origin this client may target during a web-session handoff.
-	WebAppURL string
+	WebAppURL      string
+	LogoURL        string
+	AppCallbackURL string
 
 	redirects []redirectTarget
 }
 
-// redirectTarget is a parsed loopback redirect URI. An empty port means
-// "any port".
+// redirectTarget is a parsed redirect URI. An empty port is a wildcard only
+// for HTTP loopback templates.
 type redirectTarget struct {
 	scheme string
 	host   string
@@ -105,7 +105,19 @@ func NewRegistry(policies []ClientPolicy) (*Registry, error) {
 			if err != nil {
 				return nil, fmt.Errorf("oauth client %q: %w", policy.ClientID, err)
 			}
+			if target.scheme == "https" && target.path != "/auth/apps/"+policy.ClientID+"/callback" {
+				return nil, errors.New("public callback must identify its registered client")
+			}
 			policy.redirects = append(policy.redirects, target)
+		}
+		if policy.AppCallbackURL != "" {
+			appURL, err := url.Parse(policy.AppCallbackURL)
+			if err != nil || appURL.Opaque != "" || appURL.User != nil || appURL.Host != "oauth" || appURL.Path != "/callback" || appURL.RawQuery != "" || appURL.Fragment != "" || !regexp.MustCompile(`^[a-z][a-z0-9+.-]*$`).MatchString(appURL.Scheme) || strings.Contains("|http|https|file|javascript|data|blob|about|", "|"+appURL.Scheme+"|") {
+				return nil, errors.New("invalid native app callback URL")
+			}
+		}
+		if policy.LogoURL != "" && (!regexp.MustCompile(`^/assets/[A-Za-z0-9_-]+\.(png|svg|webp)$`).MatchString(policy.LogoURL)) {
+			return nil, errors.New("app logo must be a local public asset")
 		}
 		registry.clients[policy.ClientID] = policy
 	}
@@ -139,8 +151,8 @@ func (r *Registry) ScopesSupported() []string {
 }
 
 // ValidateRedirectURI reports whether raw matches one of the client's
-// registered templates. The request must supply an explicit port; only its
-// value is free-form.
+// registered targets. HTTPS matches exactly; HTTP loopback requests supply an
+// explicit port that may vary when the template leaves it unpinned.
 func (r *Registry) ValidateRedirectURI(policy ClientPolicy, raw string) error {
 	target, err := parseRedirectRequest(raw)
 	if err != nil {
@@ -150,7 +162,7 @@ func (r *Registry) ValidateRedirectURI(policy ClientPolicy, raw string) error {
 		if target.scheme != expected.scheme || target.host != expected.host || target.path != expected.path {
 			continue
 		}
-		if expected.port != "" && target.port != expected.port {
+		if (expected.scheme == "https" || expected.port != "") && target.port != expected.port {
 			continue
 		}
 		return nil
@@ -159,7 +171,7 @@ func (r *Registry) ValidateRedirectURI(policy ClientPolicy, raw string) error {
 }
 
 // parseRedirectTemplate validates a registered redirect URI. The port is
-// optional here and, when omitted, acts as a wildcard.
+// optional here and acts as a wildcard only for HTTP loopback targets.
 func parseRedirectTemplate(raw string) (redirectTarget, error) {
 	target, err := parseRedirectCommon(raw)
 	if err != nil {
@@ -184,6 +196,9 @@ func parseRedirectRequest(raw string) (redirectTarget, error) {
 	if err != nil {
 		return redirectTarget{}, err
 	}
+	if target.scheme == "https" {
+		return target, nil
+	}
 	if target.port == "" {
 		return redirectTarget{}, fmt.Errorf("redirect_uri %q must carry an explicit port", raw)
 	}
@@ -193,13 +208,21 @@ func parseRedirectRequest(raw string) (redirectTarget, error) {
 	return target, nil
 }
 
-// parseRedirectCommon enforces the loopback shape. Host comparison runs on the
+// parseRedirectCommon enforces the public Website or loopback shape. Host comparison runs on the
 // parsed hostname rather than the raw string, otherwise
 // "http://127.0.0.1.evil.com/callback" would satisfy a prefix check.
 func parseRedirectCommon(raw string) (redirectTarget, error) {
 	parsed, err := url.Parse(raw)
 	if err != nil {
 		return redirectTarget{}, fmt.Errorf("redirect_uri %q is not a valid URI", raw)
+	}
+	if parsed.Scheme == "https" && parsed.Hostname() != "" && parsed.Hostname() != "127.0.0.1" && parsed.Hostname() != "::1" && parsed.User == nil && parsed.RawQuery == "" && parsed.Fragment == "" && regexp.MustCompile(`^/auth/apps/[A-Za-z0-9_-]+/callback$`).MatchString(parsed.Path) {
+		if port := parsed.Port(); port != "" {
+			if value, err := strconv.Atoi(port); err != nil || value < 1 || value > 65535 {
+				return redirectTarget{}, errors.New("invalid HTTPS callback port")
+			}
+		}
+		return redirectTarget{scheme: parsed.Scheme, host: parsed.Hostname(), port: parsed.Port(), path: parsed.Path}, nil
 	}
 	if parsed.Scheme != "http" {
 		return redirectTarget{}, fmt.Errorf("redirect_uri %q must use http", raw)

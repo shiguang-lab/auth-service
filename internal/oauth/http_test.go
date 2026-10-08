@@ -126,41 +126,62 @@ func TestAuthorizePermissionErrorNamesTheRequestedClient(t *testing.T) {
 	}
 }
 
-func TestConsentPageRendersClientAndScopes(t *testing.T) {
+func TestAuthorizeRedirectsToWebsiteAndContextIsSessionBound(t *testing.T) {
 	handler, h := newTestHandler(t)
 	h.seedSession(t, "sess-1", testSubject, []string{testEntitle})
 	_, challenge := pkcePair(t)
-
-	query := url.Values{
-		"response_type":         {"code"},
-		"client_id":             {testClientID},
-		"redirect_uri":          {testRedirect},
-		"scope":                 {"documents:read offline_access"},
-		"state":                 {testState},
-		"code_challenge":        {challenge},
-		"code_challenge_method": {"S256"},
-	}
+	query := url.Values{"response_type": {"code"}, "client_id": {testClientID}, "redirect_uri": {testRedirect}, "scope": {"documents:read offline_access"}, "state": {testState}, "code_challenge": {challenge}, "code_challenge_method": {"S256"}}
 	request := httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+query.Encode(), nil)
 	request.Header.Set("Cookie", cookieFor("sess-1"))
 	response := httptest.NewRecorder()
 	handler.Authorize(response, request)
-
-	if response.Code != http.StatusOK {
-		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	if response.Code != http.StatusFound {
+		t.Fatalf("status=%d", response.Code)
 	}
-	body := response.Body.String()
-	for _, expected := range []string{"知序资产中心 for Obsidian", "读取你的文档中心内容", "长期访问", "consent_id", "测试用户", "授权登录", "允许并继续", `value="deny"`, `value="allow"`} {
-		if !strings.Contains(body, expected) {
-			t.Fatalf("consent page is missing %q", expected)
+	location, err := url.Parse(response.Header().Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if location.Host != "shiguanglab.com" || location.Path != "/auth/apps/"+testClientID+"/authorize" {
+		t.Fatal("consent must render in Website")
+	}
+	id := location.Query().Get("request")
+	if id == "" {
+		t.Fatal("missing pending request")
+	}
+	contextURL := "/oauth/app/context?request=" + url.QueryEscape(id)
+	for _, tc := range []struct {
+		cookie string
+		status int
+	}{{"", 401}, {cookieFor("sess-1"), 200}} {
+		request = httptest.NewRequest(http.MethodGet, contextURL, nil)
+		request.Header.Set("Cookie", tc.cookie)
+		response = httptest.NewRecorder()
+		handler.AppContext(response, request)
+		if response.Code != tc.status {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+		}
+		if response.Header().Get("Cache-Control") != "no-store" {
+			t.Fatal("context must not be cached")
+		}
+		if tc.status == 200 {
+			for _, expected := range []string{"知序资产中心 for Obsidian", "测试用户", "读取你的文档中心内容"} {
+				if !strings.Contains(response.Body.String(), expected) {
+					t.Fatalf("context missing %q", expected)
+				}
+			}
 		}
 	}
-	for _, code := range []string{"documents:read", "offline_access"} {
-		if strings.Contains(body, code) {
-			t.Fatalf("consent page exposes permission code %q", code)
-		}
+	h.seedSession(t, "sess-2", "other-user", []string{testEntitle})
+	request = httptest.NewRequest(http.MethodGet, contextURL, nil)
+	request.Header.Set("Cookie", cookieFor("sess-2"))
+	response = httptest.NewRecorder()
+	handler.AppContext(response, request)
+	if response.Code != 403 {
+		t.Fatal("another account must not read consent context")
 	}
-	if response.Header().Get("Cache-Control") != "no-store" {
-		t.Fatal("the consent page must not be cached")
+	if _, err := h.service.Consent(request.Context(), id, true, cookieFor("sess-1")); err != nil {
+		t.Fatal("context reads must not consume authorization")
 	}
 }
 
@@ -298,24 +319,23 @@ func TestConsentSubmitRejectsStaleForm(t *testing.T) {
 	}
 }
 
-func TestConsentPageEscapesAccountAndApplicationNames(t *testing.T) {
+func TestAppMetadataExposesOnlyRegisteredPublicFields(t *testing.T) {
 	handler, _ := newTestHandler(t)
-	response := httptest.NewRecorder()
-	handler.renderConsent(response, &ConsentPrompt{
-		PendingID:   "pending-test",
-		ClientName:  `<script>alert("app")</script>`,
-		DisplayName: `<img src=x onerror="alert(1)">`,
-		Scopes:      []ScopePrompt{{Scope: ScopeWebSession, Description: ScopeDescriptions[ScopeWebSession]}},
-	})
-	body := response.Body.String()
-	for _, unescaped := range []string{`<script>`, `<img src=x`, `web:session`} {
-		if strings.Contains(body, unescaped) {
-			t.Fatalf("unsafe or technical content exposed: %q", unescaped)
+	for _, tc := range []struct {
+		id     string
+		status int
+	}{{testClientID, 200}, {"unknown", 404}} {
+		request := httptest.NewRequest(http.MethodGet, "/oauth/app?client_id="+tc.id, nil)
+		response := httptest.NewRecorder()
+		handler.AppMetadata(response, request)
+		if response.Code != tc.status {
+			t.Fatalf("status=%d", response.Code)
 		}
-	}
-	for _, expected := range []string{`&lt;script&gt;`, `&lt;img`, `name="consent_id" value="pending-test"`, ScopeDescriptions[ScopeWebSession]} {
-		if !strings.Contains(body, expected) {
-			t.Fatalf("consent page missing %q", expected)
+		body := response.Body.String()
+		for _, private := range []string{"entitlements", "audience", "redirect_uris", "session_credential"} {
+			if strings.Contains(body, private) {
+				t.Fatalf("metadata exposes %s", private)
+			}
 		}
 	}
 }

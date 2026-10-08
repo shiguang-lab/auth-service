@@ -163,3 +163,28 @@ func TestScopeSubset(t *testing.T) {
 		t.Fatal("expected an empty request to be a subset")
 	}
 }
+
+func TestRegisteredPublicAppCallbackMustMatchExactly(t *testing.T) {
+	policy := testPolicy(t, "https://shiguanglab.com/auth/apps/obsidian-asset-hub/callback")
+	policy.AppCallbackURL = "notes-desktop://oauth/callback"
+	policy.LogoURL = "/assets/notes.png"
+	registry, err := NewRegistry([]ClientPolicy{policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, _ = registry.Client(policy.ClientID)
+	if err := registry.ValidateRedirectURI(policy, policy.RedirectURIs[0]); err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range []string{"https://evil.com/auth/apps/obsidian-asset-hub/callback", "https://shiguanglab.com:8443/auth/apps/obsidian-asset-hub/callback", "https://shiguanglab.com/auth/apps/other/callback", "https://shiguanglab.com/auth/apps/obsidian-asset-hub/callback?return_to=evil", "http://shiguanglab.com/auth/apps/obsidian-asset-hub/callback"} {
+		if registry.ValidateRedirectURI(policy, candidate) == nil {
+			t.Fatalf("accepted unregistered callback %q", candidate)
+		}
+	}
+	for _, uri := range []string{"https://oauth/callback", "javascript:alert(1)", "file://oauth/callback", "notes-desktop://evil/callback", "notes-desktop://oauth/callback?target=evil"} {
+		policy.AppCallbackURL = uri
+		if _, err := NewRegistry([]ClientPolicy{policy}); err == nil {
+			t.Fatalf("accepted unsafe app URL %q", uri)
+		}
+	}
+}

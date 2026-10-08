@@ -149,9 +149,14 @@ func TestConsentPageRendersClientAndScopes(t *testing.T) {
 		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
 	}
 	body := response.Body.String()
-	for _, expected := range []string{"知序资产中心 for Obsidian", "读取你的文档中心内容", "长期访问", "consent_id"} {
+	for _, expected := range []string{"知序资产中心 for Obsidian", "读取你的文档中心内容", "长期访问", "consent_id", "测试用户", "授权登录", "允许并继续", `value="deny"`, `value="allow"`} {
 		if !strings.Contains(body, expected) {
 			t.Fatalf("consent page is missing %q", expected)
+		}
+	}
+	for _, code := range []string{"documents:read", "offline_access"} {
+		if strings.Contains(body, code) {
+			t.Fatalf("consent page exposes permission code %q", code)
 		}
 	}
 	if response.Header().Get("Cache-Control") != "no-store" {
@@ -290,5 +295,27 @@ func TestConsentSubmitRejectsStaleForm(t *testing.T) {
 
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", response.Code)
+	}
+}
+
+func TestConsentPageEscapesAccountAndApplicationNames(t *testing.T) {
+	handler, _ := newTestHandler(t)
+	response := httptest.NewRecorder()
+	handler.renderConsent(response, &ConsentPrompt{
+		PendingID:   "pending-test",
+		ClientName:  `<script>alert("app")</script>`,
+		DisplayName: `<img src=x onerror="alert(1)">`,
+		Scopes:      []ScopePrompt{{Scope: ScopeWebSession, Description: ScopeDescriptions[ScopeWebSession]}},
+	})
+	body := response.Body.String()
+	for _, unescaped := range []string{`<script>`, `<img src=x`, `web:session`} {
+		if strings.Contains(body, unescaped) {
+			t.Fatalf("unsafe or technical content exposed: %q", unescaped)
+		}
+	}
+	for _, expected := range []string{`&lt;script&gt;`, `&lt;img`, `name="consent_id" value="pending-test"`, ScopeDescriptions[ScopeWebSession]} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("consent page missing %q", expected)
+		}
 	}
 }

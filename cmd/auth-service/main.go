@@ -235,6 +235,7 @@ func main() {
 			CodeTTL:              cfg.OAuthCodeTTL,
 			ConsentTTL:           cfg.OAuthConsentTTL,
 			RequiredEntitlements: cfg.OAuthRequiredEntitlements,
+			DefaultEntitlements:  cfg.DefaultEntitlements,
 		})
 		if err != nil {
 			logger.Error("initialize oauth service", "error", err)

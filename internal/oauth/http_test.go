@@ -105,6 +105,27 @@ func TestAuthorizeRedirectsToLoginWhenUnauthenticated(t *testing.T) {
 	}
 }
 
+func TestAuthorizePermissionErrorNamesTheRequestedClient(t *testing.T) {
+	handler, h := newTestHandler(t)
+	h.seedSession(t, "sess-1", testSubject, []string{testEntitle})
+	_, challenge := pkcePair(t)
+	query := url.Values{
+		"response_type": {"code"}, "client_id": {"other-client"},
+		"redirect_uri": {testRedirect}, "scope": {ScopeDocumentsRead},
+		"state": {testState}, "code_challenge": {challenge}, "code_challenge_method": {"S256"},
+	}
+	request := httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+query.Encode(), nil)
+	request.Header.Set("Cookie", cookieFor("sess-1"))
+	response := httptest.NewRecorder()
+	handler.Authorize(response, request)
+	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "没有访问另一个客户端的权限") {
+		t.Fatalf("wrong permission error: status=%d body=%s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "知序资产中心") || response.Header().Get("Location") != "" {
+		t.Fatal("permission failure must name the requested app and remain forbidden")
+	}
+}
+
 func TestConsentPageRendersClientAndScopes(t *testing.T) {
 	handler, h := newTestHandler(t)
 	h.seedSession(t, "sess-1", testSubject, []string{testEntitle})

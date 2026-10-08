@@ -138,6 +138,11 @@ to register several native applications; the device confirmation page reads the
 registered client name and scopes dynamically and contains no app-specific flow.
 Each client owns its scopes, API audience, optional web-session target and
 required entitlements. Device-only clients do not need a redirect URI.
+Browser sessions retain the entitlement snapshot from sign-in. If an OAuth
+authorization requires an entitlement absent from that snapshot but granted by
+the current `DEFAULT_ENTITLEMENTS`, the browser returns to login and resumes the
+same PKCE request after a fresh sign-in. Entitlements outside the default policy
+remain forbidden; error pages name the requested registered application.
 
 The compatibility forward-auth endpoint consumes the standard `X-Forwarded-Method`,
 `X-Forwarded-Uri`, `X-Forwarded-Host`, and `X-Forwarded-Proto` headers plus

@@ -193,7 +193,7 @@ func (h *Handler) Authorize(response http.ResponseWriter, request *http.Request)
 		Cookie:              request.Header.Get("Cookie"),
 	})
 	if err != nil {
-		h.respondAuthorizeFailure(response, err)
+		h.respondAuthorizeFailure(response, err, query.Get("client_id"))
 		return
 	}
 	if outcome.Redirect != "" {
@@ -297,10 +297,11 @@ func (h *Handler) Revoke(response http.ResponseWriter, request *http.Request) {
 	response.WriteHeader(http.StatusOK)
 }
 
-func (h *Handler) respondAuthorizeFailure(response http.ResponseWriter, err error) {
+func (h *Handler) respondAuthorizeFailure(response http.ResponseWriter, err error, clientID string) {
 	switch {
 	case errors.Is(err, ErrMissingScope):
-		h.renderError(response, http.StatusForbidden, "当前账号没有访问知序资产中心的权限，请联系管理员开通。")
+		policy, _ := h.service.Registry().Client(clientID)
+		h.renderError(response, http.StatusForbidden, "当前账号没有访问"+policy.Name+"的权限，请联系管理员开通。")
 	case errors.Is(err, ErrNoSession):
 		h.renderError(response, http.StatusUnauthorized, "登录状态已失效，请重新登录后重试。")
 	default:

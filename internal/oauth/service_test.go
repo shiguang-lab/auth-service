@@ -470,6 +470,53 @@ func TestAuthorizeRejectsMissingEntitlement(t *testing.T) {
 	}
 }
 
+func TestAuthorizeReauthenticatesOldDefaultEntitlementSnapshot(t *testing.T) {
+	h := newHarness(t)
+	h.service.defaultEntitlements = []string{testEntitle}
+	h.seedSession(t, "sess-1", testSubject, []string{"platform:access"})
+	_, challenge := pkcePair(t)
+	request := defaultAuthorizeRequest(challenge)
+	outcome, err := h.service.Authorize(context.Background(), request)
+	if err != nil || outcome.Consent != nil || outcome.Redirect == "" {
+		t.Fatalf("stale session must reauthenticate before consent: %#v, %v", outcome, err)
+	}
+	returnTo, err := url.Parse(queryParam(t, outcome.Redirect, "return_to"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, expected := range map[string]string{
+		"client_id": request.ClientID, "redirect_uri": request.RedirectURI,
+		"scope": request.Scope, "state": request.State,
+		"code_challenge": challenge, "code_challenge_method": "S256",
+	} {
+		if returnTo.Query().Get(key) != expected {
+			t.Fatalf("login redirect changed %s", key)
+		}
+	}
+	stored, err := h.sessions.Get(context.Background(), "sess-1")
+	if err != nil || containsAll(stored.Entitlements, []string{testEntitle}) {
+		t.Fatal("redirect must not grant permissions to the existing session")
+	}
+	h.seedSession(t, "sess-1", testSubject, []string{testEntitle})
+	outcome, err = h.service.Authorize(context.Background(), request)
+	if err != nil || outcome.Consent == nil || outcome.Redirect != "" {
+		t.Fatalf("fresh login must reach consent: %#v, %v", outcome, err)
+	}
+}
+
+func TestAuthorizeDoesNotReauthenticateForRestrictedClientEntitlements(t *testing.T) {
+	h := newHarness(t)
+	h.service.defaultEntitlements = []string{testEntitle}
+	h.seedSession(t, "sess-1", testSubject, []string{testEntitle})
+	_, challenge := pkcePair(t)
+	request := defaultAuthorizeRequest(challenge)
+	request.ClientID = "other-client"
+	request.Scope = ScopeDocumentsRead
+	if _, err := h.service.Authorize(context.Background(), request); !errors.Is(err, ErrMissingScope) {
+		t.Fatalf("restricted client must stay forbidden, got %v", err)
+	}
+}
+
 func TestConsentDeniedReturnsAccessDenied(t *testing.T) {
 	h := newHarness(t)
 	h.seedSession(t, "sess-1", testSubject, []string{testEntitle})

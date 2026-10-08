@@ -81,6 +81,9 @@ type ServiceOptions struct {
 	// RequiredEntitlements must all be present on the user's session before a
 	// scope can be granted.
 	RequiredEntitlements []string
+	// DefaultEntitlements are granted by a fresh browser login. Sessions with an
+	// older snapshot must sign in again before authorizing a newly enabled app.
+	DefaultEntitlements []string
 }
 
 type Service struct {
@@ -98,6 +101,7 @@ type Service struct {
 	codeTTL              time.Duration
 	consentTTL           time.Duration
 	requiredEntitlements []string
+	defaultEntitlements  []string
 	now                  func() time.Time
 }
 
@@ -144,6 +148,7 @@ func NewService(options ServiceOptions) (*Service, error) {
 		codeTTL:              options.CodeTTL,
 		consentTTL:           options.ConsentTTL,
 		requiredEntitlements: append([]string(nil), options.RequiredEntitlements...),
+		defaultEntitlements:  append([]string(nil), options.DefaultEntitlements...),
 		now:                  time.Now,
 	}, nil
 }
@@ -280,6 +285,9 @@ func (s *Service) Authorize(ctx context.Context, request AuthorizeRequest) (Auth
 		return AuthorizeOutcome{}, err
 	}
 	if !containsAll(value.Entitlements, s.requiredFor(policy)) {
+		if containsAll(s.defaultEntitlements, s.requiredFor(policy)) {
+			return AuthorizeOutcome{Redirect: s.loginRedirect(request)}, nil
+		}
 		return AuthorizeOutcome{}, ErrMissingScope
 	}
 
